@@ -1,0 +1,15 @@
+/temp
+/videos
+GraphAPI.ini
+
+**.7z
+**.txt
+
+.env
+garbage/
+credentials.json
+
+*_test.py
+*.ipynb
+
+logo.png
