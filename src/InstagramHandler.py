@@ -6,7 +6,7 @@ import mimetypes
 import uuid
 
 ENV_PATH = ".env"
-GRAPH_BASE = "https://graph.facebook.com/v21.0"
+GRAPH_BASE = "https://graph.facebook.com/v24.0"
 
 
 class InstagramHandler:
@@ -134,6 +134,7 @@ class InstagramHandler:
             "user_tags": user_tags,
             "product_tags": product_tags,
             "thumb_offset": thumb_offset,
+            "media_type": "CAROUSEL" if is_carousel_item else ("VIDEO" if video_url else "IMAGE"),
         }
         if image_url:
             payload["image_url"] = image_url
@@ -142,6 +143,69 @@ class InstagramHandler:
         payload = {k: v for k, v in payload.items() if v is not None}
         r = self._post(f"{self.ig_business_id}/media", payload)
         return r["id"]
+
+    # -----------------------
+    # Resumable upload helpers (rupload)
+    # -----------------------
+    def create_resumable_media_container(
+        self,
+        *,
+        media_type: str = "REELS",
+        caption: Optional[str] = None,
+        thumb_offset: Optional[int] = None,
+        is_carousel_item: bool = False,
+        additional: Optional[dict] = None,
+    ) -> Dict:
+        """
+        Initialize a resumable upload session for a video. Returns dict with at least `id` and `uri`.
+        """
+        payload = {
+            "upload_type": "resumable",
+            "media_type": media_type,
+            "is_carousel_item": is_carousel_item,
+        }
+        if caption:
+            payload["caption"] = caption
+        if thumb_offset is not None:
+            payload["thumb_offset"] = int(thumb_offset)
+        if additional:
+            payload.update(additional)
+
+        # Use requests directly so we can control JSON body and headers
+        headers = {"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json"}
+        r = requests.post(f"{GRAPH_BASE}/{self.ig_business_id}/media", headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def upload_resumable_video(self, upload_uri: str, *, local_path: Optional[str] = None, file_url: Optional[str] = None, offset: int = 0) -> Dict:
+        """
+        Upload the video data to the rupload endpoint returned by `create_resumable_media_container`.
+        - For local files, pass `local_path` and the file will be POSTed with headers `offset` and `file_size`.
+        - For hosted files, pass `file_url` and the `file_url` header will be used.
+        Returns the JSON response from the rupload server.
+        """
+        headers = {"Authorization": f"OAuth {self.access_token}"}
+        if local_path:
+            file_size = os.path.getsize(local_path)
+            headers.update({"offset": str(offset), "file_size": str(file_size)})
+            with open(local_path, "rb") as fh:
+                r = requests.post(upload_uri, headers=headers, data=fh)
+        elif file_url:
+            headers.update({"file_url": file_url})
+            r = requests.post(upload_uri, headers=headers)
+        else:
+            raise ValueError("Either local_path or file_url must be provided")
+
+        r.raise_for_status()
+        # rupload often returns plain JSON-like text
+        try:
+            return r.json()
+        except Exception:
+            return {"raw": r.text}
+
+    def get_container_video_status(self, creation_id: str) -> Dict:
+        """Return the fields related to video upload/processing for a container."""
+        return self._get(creation_id, {"fields": "id,status,status_code,video_status"})
 
     def get_container_status(self, creation_id: str) -> str:
         """Check the status of a media container. Returns 'FINISHED', 'ERROR', etc."""

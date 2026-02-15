@@ -4,13 +4,14 @@ import traceback
 from typing import List
 from pathlib import Path
 
-from moviepy.editor import (
+from moviepy import (
     VideoFileClip,
     CompositeVideoClip,
     ImageClip,
-    vfx,
+    vfx
 )
 from skimage.filters import gaussian
+
 
 
 class ClipBuilder:
@@ -73,67 +74,60 @@ class ClipBuilder:
     # ---------------------------------------------------
     # CONVERT TO REELS
     # ---------------------------------------------------
+    def blur(self,gf,t):
+        """ Returns a blurred (radius=2 pixels) version of the image """
+        image = gf(t)
+        return gaussian(image.astype(float), sigma=2)
+
+    
     def convert_to_reels(
         self,
         input_clip: str,
         output_clip: str,
-        target_height: int = 480,
+        height: int = 480,
     ) -> None:
         clip = VideoFileClip(input_clip)
         width, height = clip.size
 
-        crop_width = int(width * 0.10)
-        crop_height = int(height * 0.10)
+        # Calculate the crop dimensions
+        crop_width = int(width * 0.10)   # 5% from the right
+        crop_height = int(height * 0.10) # 5% from the bottom
 
+        # Apply the crop effect
+        # remove 5% from each side of the video to remove watermarks/logos
         clip = clip.with_effects([
             vfx.Crop(
-                x1=0,
-                y1=0,
-                x2=width - crop_width,
-                y2=height - crop_height,
+                x1=0,#crop_width,  # Crop from the left
+                y1=0,#crop_height, # Crop from the top
+                x2=width - crop_width,  # Crop from the right
+                y2=height - crop_height # Crop from the bottom
             )
         ])
+        # Check if the video is landscape (width > height)
+        print("Converting landscape video to Reels format...")
 
-        if clip.size[0] <= clip.size[1]:
-            clip.write_videofile(
-                output_clip,
-                codec="libx264",
-                audio_codec="aac",
-                preset="ultrafast",
-            )
-            return
-
-        # Background
-        new_width = clip.size[1] * target_height // clip.size[0]
-        background = clip.with_effects([
-            vfx.Resize(height=target_height),
-            vfx.Crop(x_center=clip.size[0] // 2, width=new_width),
-        ]).transform(self.blur)
-
-        # Main video
-        main = clip.with_effects([
-            vfx.Resize(width=new_width)
-        ])
-
-        layers = [background, main.with_position("center")]
-
-        if self.logo_path and self.logo_path.exists():
-            logo = (
-                ImageClip(str(self.logo_path))
-                .with_duration(clip.duration)
-                .with_effects([vfx.Resize(height=50), vfx.Margin(bottom=10, opacity=0)])
-                .with_position(("center", "bottom"))
-            )
-            layers.append(logo)
-
-        final = CompositeVideoClip(layers)
-        final.write_videofile(
-            output_clip,
-            codec="libx264",
-            audio_codec="aac",
-            threads=4,
-            preset="ultrafast",
-        )
+        if clip.size[0] > clip.size[1]:
+            print("Converting landscape video to Reels format...")
+            
+            # Resize to 9:16 aspect ratio with zoomed-in background (cropping/zooming part)
+            # Make background video (zoomed & blurred)
+            width = clip.size[1] * height // clip.size[0]
+            background_clip = clip.with_effects([vfx.Resize(height=height),vfx.Crop(x_center=clip.size[0] // 2, width=width)])
+            background_clip = background_clip.transform(self.blur)
+            # Crop the original clip to center and match the 9:16 aspect ratio
+            main_clip = clip.with_effects([vfx.Resize(width=width)]) 
+            
+            logo = ImageClip("./logo/logo.png").with_duration(clip.duration)
+            logo = logo.with_effects([vfx.Resize(height=50),vfx.Margin(bottom=10,opacity=0)])
+            
+            # Overlay the main clip on the background clip
+            final_clip = CompositeVideoClip([background_clip, main_clip.with_position(("center", "center")),logo.with_position(("center", "bottom"))])
+            
+            # Write the final clip to file with a more comprehensive argument for video settings
+            final_clip.write_videofile(output_clip, codec="libx264", audio_codec="aac", threads=12, preset='ultrafast',ffmpeg_params=["-movflags", "+faststart"])
+            print(f"Reels format video saved to {output_clip}")
+        else:
+            print("No need for conversion, video is already in vertical format.")
 
     # ---------------------------------------------------
     # FULL PIPELINE

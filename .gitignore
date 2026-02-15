@@ -1,4 +1,3 @@
-/temp
 /videos
 GraphAPI.ini
 
@@ -9,8 +8,18 @@ GraphAPI.ini
 garbage/
 credentials.json
 token.pickle
-
+/__pycache__
 *_test.py
 *.ipynb
 
 logo.png
+
+/reels/*
+/clips/*
+/temp/*
+*.log
+*.db
+
+/logo/*
+
+*.mp4

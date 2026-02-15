@@ -2,10 +2,11 @@ from curl_cffi import  requests
 import re
 import json
 from typing import List, Callable, Optional
+import scrapetube
+from yt_dlp import YoutubeDL
+from pathlib import Path
 
 class YoutubeExtractorHandler:
-    def __init__(self):
-        self.session = requests.Session()
 
     # --- Fetch videos from search query ---
     def search_videos_depreciated(
@@ -19,7 +20,7 @@ class YoutubeExtractorHandler:
         Optionally filter results with filter_fn(video_dict) -> bool
         """
         search_url = f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"
-        response = self.session.get(search_url)
+        response = requests.get(search_url)
         
         # Extract JSON from ytInitialData
         script_match = re.search(r'<script.*?>\s*var ytInitialData = ({.*?});\s*</script>', response.text, re.DOTALL)
@@ -81,7 +82,7 @@ class YoutubeExtractorHandler:
     
     # --- Extract points without concatenation ---
     def get_points(self, url: str, top_x: int = 5) -> List[dict]:
-        response = self.session.get(url)
+        response = requests.get(url)
         script_match = re.search(r'<script.*?>\s*var ytInitialData = ({.*?});\s*</script>', response.text, re.DOTALL)
         if not script_match:
             print("ytInitialData not found")
@@ -89,16 +90,24 @@ class YoutubeExtractorHandler:
 
         json_data = json.loads(script_match.group(1))
         try:
-            scores = json_data["frameworkUpdates"]["entityBatchUpdate"]["mutations"][0]["payload"]["macroMarkersListEntity"]["markersList"]["markers"]
-            max_intensity_elements = sorted(scores, key=lambda x: x['intensityScoreNormalized'])
-            return max_intensity_elements[-top_x:]
+            scores = None
+            for i in json_data["frameworkUpdates"]["entityBatchUpdate"]["mutations"]:
+                try:
+                    if i.get("payload"):
+                        if i["payload"]["macroMarkersListEntity"]["markersList"]["markers"]:
+                            scores = i["payload"]["macroMarkersListEntity"]["markersList"]["markers"]
+                            break
+                except KeyError:
+                    continue        
         except KeyError:
             print("Markers not found in video data")
             return []
+        max_intensity_elements = sorted(scores, key=lambda x: x['intensityScoreNormalized'])
+        return max_intensity_elements[-top_x:]
 
     # --- Extract points with concatenation ---
     def get_points_concatenated(self, url: str, top_x: int = 5) -> List[dict]:
-        response = self.session.get(url)
+        response = requests.get(url)
         script_match = re.search(r'<script.*?>\s*var ytInitialData = ({.*?});\s*</script>', response.text, re.DOTALL)
         if not script_match:
             print("ytInitialData not found")
@@ -106,7 +115,15 @@ class YoutubeExtractorHandler:
 
         json_data = json.loads(script_match.group(1))
         try:
-            scores = json_data["frameworkUpdates"]["entityBatchUpdate"]["mutations"][0]["payload"]["macroMarkersListEntity"]["markersList"]["markers"]
+            scores = None
+            for i in json_data["frameworkUpdates"]["entityBatchUpdate"]["mutations"]:
+                try:
+                    if i.get("payload"):
+                        if i["payload"]["macroMarkersListEntity"]["markersList"]["markers"]:
+                            scores = i["payload"]["macroMarkersListEntity"]["markersList"]["markers"]
+                            break
+                except KeyError:
+                    continue        
         except KeyError:
             print("Markers not found in video data")
             return []

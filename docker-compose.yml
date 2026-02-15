@@ -1,0 +1,19 @@
+version: '3.8'
+services:
+  reelsbuilder:
+    build: .
+    container_name: reelsbuilder
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+      - ./clips:/app/clips
+      - ./reels:/app/reels
+      - ./temp:/app/temp
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "run_manager.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
