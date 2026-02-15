@@ -13,13 +13,12 @@ class InstagramHandler:
     """
     Instagram Business API Handler (Graph API only)
     - Posting content (image / video / carousel)
-    - Local media uploads
+    - Using media URLs
     - Reading & replying to DMs
     - Listing conversations
     - Fetching conversation history (limit)
     - Replying to comments
-    - DMing users (webhook triggered, e.g. new followers)
-    - Exporting conversation as JSON (AI-ready, fully formatted)
+    - Exporting conversation as JSON
     """
 
     def __init__(self, env_path: str = ".env"):
@@ -144,26 +143,99 @@ class InstagramHandler:
         r = self._post(f"{self.ig_business_id}/media", payload)
         return r["id"]
 
+    def get_container_status(self, creation_id: str) -> str:
+        """Check the status of a media container. Returns 'FINISHED', 'ERROR', etc."""
+        data = self._get(creation_id, {"fields": "status_code"})
+        return data.get("status_code")
+
     def publish_media(self, creation_id: str) -> Dict:
+        """Publishes the media once the container is finished."""
+        status = self.get_container_status(creation_id)
+        if status != "FINISHED":
+            raise RuntimeError(f"Media container not ready: {status}")
         return self._post(f"{self.ig_business_id}/media_publish", {"creation_id": creation_id})
 
+    # ------------------------------------------------------------------
+    # 🗂 MEDIA CONTAINER CRUD
+    # ------------------------------------------------------------------
+
+    def get_container_details(self, creation_id: str) -> Dict:
+        """Fetch details of an existing media container"""
+        return self._get(creation_id, {"fields": "id,status_code,media_type,media_url,thumbnail_url,caption"})
+
+    def update_container_caption(self, creation_id: str, new_caption: str) -> Dict:
+        """Update the caption of a media container (before publishing)"""
+        return self._post(creation_id, {"caption": new_caption})
+
+    def delete_container(self, creation_id: str) -> Dict:
+        """Delete a media container"""
+        r = requests.delete(f"{GRAPH_BASE}/{creation_id}", params={"access_token": self.access_token})
+        r.raise_for_status()
+        return r.json()
+
+    # ------------------------------------------------------------------
+    # 🖼 MEDIA CRUD
+    # ------------------------------------------------------------------
+
+    def get_media_details(self, media_id: str) -> Dict:
+        """Get information about a published media"""
+        return self._get(media_id, {"fields": "id,caption,media_type,media_url,permalink,timestamp"})
+
+    def update_media_caption(self, media_id: str, new_caption: str) -> Dict:
+        """Update the caption of a published media"""
+        return self._post(media_id, {"caption": new_caption})
+
+    def delete_media(self, media_id: str) -> Dict:
+        """Delete a published media"""
+        r = requests.delete(f"{GRAPH_BASE}/{media_id}", params={"access_token": self.access_token})
+        r.raise_for_status()
+        return r.json()
+
+    # ------------------------------------------------------------------
+    # 🗂 LIST MEDIA CONTAINERS
+    # ------------------------------------------------------------------
+
+    def list_media_containers(self, limit: int = 25) -> List[Dict]:
+        """
+        Lists all media containers (published or pending) for the IG Business account.
+        Returns a list of dicts with id, status_code, media_type, caption, and media_url.
+        """
+        try:
+            response = self._get(
+                f"{self.ig_business_id}/media",
+                {"fields": "id,status_code,media_type,caption,media_url,thumbnail_url", "limit": limit}
+            )
+            return response.get("data", [])
+        except requests.HTTPError as e:
+            print("❌ Failed to list media containers:", e.response.text)
+            return []
+
+    def list_published_media(self, limit: int = 25) -> List[Dict]:
+        """
+        Lists only published media.
+        Returns a list of dicts with id, caption, media_type, media_url, permalink, timestamp.
+        """
+        try:
+            response = self._get(
+                f"{self.ig_business_id}/media",
+                {"fields": "id,caption,media_type,media_url,permalink,timestamp", "limit": limit}
+            )
+            return response.get("data", [])
+        except requests.HTTPError as e:
+            print("❌ Failed to list published media:", e.response.text)
+            return []
     # ------------------------------------------------------------------
     # 💬 DIRECT MESSAGES
     # ------------------------------------------------------------------
 
     def list_conversations(self) -> List[Dict]:
-        """
-        Returns a list of Instagram conversations.
-        """
         try:
             return self._get(f"{self.ig_business_id}/conversations").get("data", [])
         except requests.HTTPError as e:
             print("❌ Failed to list conversations:", e.response.text)
             return []
+
     def get_conversation_messages(self, conversation_id: str, limit: int = 20) -> List[Dict]:
-        """
-        Fetch messages of a conversation.
-        """
         try:
             return self._get(
                 f"{conversation_id}/messages",
@@ -207,74 +279,6 @@ class InstagramHandler:
             })
         return {"conversation_id": conversation_id, "platform": "instagram", "messages": messages}
 
-    # ------------------------------------------------------------------
-    # 📂 LOCAL MEDIA UPLOAD
-    # ------------------------------------------------------------------
-
-    def upload_local_media(self, file_path: str) -> str:
-        """
-        Uploads a local media file using Facebook resumable upload.
-        Returns a media ID usable by Instagram media endpoints.
-        Works for video and images.
-        """
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(file_path)
-
-        file_size = os.path.getsize(file_path)
-        mime_type, _ = mimetypes.guess_type(file_path)
-        upload_id = str(uuid.uuid4())
-
-        # Start upload
-        start = requests.post(
-            "https://upload.facebook.com/video-upload/v21.0/start",
-            data={"access_token": self.access_token, "file_size": file_size},
-        )
-        start.raise_for_status()
-        session = start.json()
-        upload_url = session["upload_url"]
-
-        # Upload file
-        with open(file_path, "rb") as f:
-            upload = requests.post(
-                upload_url,
-                headers={"Authorization": f"OAuth {self.access_token}", "file_offset": "0"},
-                data=f,
-            )
-            upload.raise_for_status()
-
-        # Finish upload
-        finish = requests.post(
-            "https://upload.facebook.com/video-upload/v21.0/finish",
-            data={"access_token": self.access_token, "upload_session_id": session["upload_session_id"]},
-        )
-        finish.raise_for_status()
-
-        return finish.json()["video_id"]
-
-    def post_local_media(
-        self,
-        file_path: str,
-        caption: Optional[str] = None,
-        *,
-        location_id: Optional[str] = None,
-        user_tags: Optional[str] = None,
-        product_tags: Optional[str] = None,
-        thumb_offset: Optional[int] = None,
-    ) -> Dict:
-        media_id = self.upload_local_media(file_path)
-        is_video = file_path.lower().endswith((".mp4", ".mov"))
-        container = self._post(
-            f"{self.ig_business_id}/media",
-            {
-                "video_id" if is_video else "image_id": media_id,
-                "caption": caption,
-                "location_id": location_id,
-                "user_tags": user_tags,
-                "product_tags": product_tags,
-                "thumb_offset": thumb_offset,
-            },
-        )
-        return self.publish_media(container["id"])
 
 
 # ------------------------------------------------------------------
