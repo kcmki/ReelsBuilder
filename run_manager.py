@@ -10,9 +10,10 @@ from datetime import timedelta
 import configparser
 from typing import List
 import time
+import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-
+from moviepy import VideoFileClip
 # ensure src is importable
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
@@ -113,21 +114,15 @@ def load_settings(path: Path) -> configparser.ConfigParser:
 class ReelsManager:
     def __init__(self, cfg: configparser.ConfigParser):
         self.cfg = cfg
-        self.conn = sqlite3.connect(DB_PATH)
+        # allow using the connection from APScheduler worker threads
+        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        # lock to protect concurrent DB access
+        self.db_lock = threading.RLock()
         init_db(self.conn)
 
         self.extractor = YoutubeExtractorHandler()
         self.clip_builder = ClipBuilder()
-        self.drive = GoogleDriveManager()
-        # Supabase S3 storage (configured via env: endpoint, key_id, secret_key, SUPABASE_BUCKET)
-        try:
-            bucket = os.getenv("SUPABASE_BUCKET") or cfg.get("storage", "bucket", fallback=None)
-            if bucket:
-                self.storage = SupabaseS3Handler(bucket=bucket)
-            else:
-                self.storage = None
-        except Exception:
-            self.storage = None
         self.ig = InstagramHandler()
 
         # settings
@@ -138,16 +133,20 @@ class ReelsManager:
         self.reply_message = cfg.get("interactions", "reply_message", fallback="Thanks for reaching out! We will get back to you.")
         # instagram caption template for reels (can use {video_id} and {title})
         self.reels_caption = cfg.get("instagram", "reels_caption", fallback="Auto-upload {video_id}")
+        # allow disabling interactions (DMs/comments) when desired via CLI
+        self.interactions_enabled = True
 
     # --- helper DB methods ---
     def video_exists(self, video_id: str) -> bool:
-        cur = self.conn.cursor()
-        cur.execute("SELECT 1 FROM videos WHERE video_id=?", (video_id,))
-        return cur.fetchone() is not None
+        with self.db_lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT 1 FROM videos WHERE video_id=?", (video_id,))
+            return cur.fetchone() is not None
 
     def mark_video(self, video_id: str, **fields):
         now = datetime.utcnow().isoformat()
-        cur = self.conn.cursor()
+        with self.db_lock:
+            cur = self.conn.cursor()
 
         # sanitize fields: JSON-serialize dicts/lists to avoid sqlite binding errors
         safe_fields = {}
@@ -163,42 +162,44 @@ class ReelsManager:
             else:
                 safe_fields[k] = v
 
-        if self.video_exists(video_id):
-            if safe_fields:
-                sets = ",".join([f"{k}=?" for k in safe_fields.keys()])
-                values = list(safe_fields.values()) + [now, video_id]
-                cur.execute(f"UPDATE videos SET {sets}, last_updated=? WHERE video_id=?", values)
+            if self.video_exists(video_id):
+                if safe_fields:
+                    sets = ",".join([f"{k}=?" for k in safe_fields.keys()])
+                    values = list(safe_fields.values()) + [now, video_id]
+                    cur.execute(f"UPDATE videos SET {sets}, last_updated=? WHERE video_id=?", values)
+                else:
+                    cur.execute("UPDATE videos SET last_updated=? WHERE video_id=?", (now, video_id))
             else:
-                cur.execute("UPDATE videos SET last_updated=? WHERE video_id=?", (now, video_id))
-        else:
-            cur.execute(
-                "INSERT INTO videos (video_id, title, url, downloaded_at, clips_created, drive_file_id, drive_public_url, instagram_media_id, last_updated) VALUES (?,?,?,?,?,?,?,?,?)",
-                (
-                    video_id,
-                    safe_fields.get("title"),
-                    safe_fields.get("url"),
-                    safe_fields.get("downloaded_at"),
-                    safe_fields.get("clips_created", 0),
-                    safe_fields.get("drive_file_id"),
-                    safe_fields.get("drive_public_url"),
-                    safe_fields.get("instagram_media_id"),
-                    now,
-                ),
-            )
-        self.conn.commit()
+                cur.execute(
+                    "INSERT INTO videos (video_id, title, url, downloaded_at, clips_created, drive_file_id, drive_public_url, instagram_media_id, last_updated) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        video_id,
+                        safe_fields.get("title"),
+                        safe_fields.get("url"),
+                        safe_fields.get("downloaded_at"),
+                        safe_fields.get("clips_created", 0),
+                        safe_fields.get("drive_file_id"),
+                        safe_fields.get("drive_public_url"),
+                        safe_fields.get("instagram_media_id"),
+                        now,
+                    ),
+                )
+            self.conn.commit()
 
     def interaction_exists(self, platform: str, external_id: str) -> bool:
-        cur = self.conn.cursor()
-        cur.execute("SELECT 1 FROM interactions WHERE platform=? AND external_id=?", (platform, external_id))
-        return cur.fetchone() is not None
+        with self.db_lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT 1 FROM interactions WHERE platform=? AND external_id=?", (platform, external_id))
+            return cur.fetchone() is not None
 
     def record_interaction(self, platform: str, external_id: str, itype: str, payload: str = ""):
-        cur = self.conn.cursor()
-        cur.execute(
-            "INSERT INTO interactions (platform, external_id, type, payload, replied_at) VALUES (?,?,?,?,?)",
-            (platform, external_id, itype, payload, datetime.utcnow().isoformat()),
-        )
-        self.conn.commit()
+        with self.db_lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO interactions (platform, external_id, type, payload, replied_at) VALUES (?,?,?,?,?)",
+                (platform, external_id, itype, payload, datetime.utcnow().isoformat()),
+            )
+            self.conn.commit()
 
     # --- main processes ---
     def search_download_publish(self):
@@ -326,12 +327,13 @@ class ReelsManager:
                                 except Exception:
                                     duration = None
 
-                                cur = self.conn.cursor()
-                                cur.execute(
-                                    "INSERT INTO clips (video_id, clip_path, reel_path, duration, drive_file_id, created_at, published, published_at) VALUES (?,?,?,?,?,?,?,?)",
-                                    (video_id, clip_path, reel_path, duration, None, datetime.utcnow().isoformat(), 0, None),
-                                )
-                                self.conn.commit()
+                                with self.db_lock:
+                                    cur = self.conn.cursor()
+                                    cur.execute(
+                                        "INSERT INTO clips (video_id, clip_path, reel_path, duration, drive_file_id, created_at, published, published_at) VALUES (?,?,?,?,?,?,?,?)",
+                                        (video_id, clip_path, reel_path, duration, None, datetime.utcnow().isoformat(), 0, None),
+                                    )
+                                    self.conn.commit()
                                 clips_added += 1
                                 logger.info(f"Recorded clip (unpublished) in DB: {reel_path}")
                             except Exception:
@@ -345,6 +347,8 @@ class ReelsManager:
                             caption = self.reels_caption.format(video_id=video_id, title=(video.get("title") if isinstance(video, dict) else ""))
                             # Step 1: create resumable media container
                             try:
+                                from moviepy import VideoFileClip
+                                
                                 video = VideoFileClip(reel_path)
                                 duration = int(video.duration)
                                 thumb_offset = max(1, duration // 2)
@@ -413,12 +417,13 @@ class ReelsManager:
                                 except Exception:
                                     duration = None
 
-                                cur = self.conn.cursor()
-                                cur.execute(
-                                    "INSERT INTO clips (video_id, clip_path, reel_path, duration, drive_file_id, created_at, published, published_at) VALUES (?,?,?,?,?,?,?,?)",
-                                    (video_id, clip_path, reel_path, duration, None, datetime.utcnow().isoformat(), 1, datetime.utcnow().isoformat()),
-                                )
-                                self.conn.commit()
+                                with self.db_lock:
+                                    cur = self.conn.cursor()
+                                    cur.execute(
+                                        "INSERT INTO clips (video_id, clip_path, reel_path, duration, drive_file_id, created_at, published, published_at) VALUES (?,?,?,?,?,?,?,?)",
+                                        (video_id, clip_path, reel_path, duration, None, datetime.utcnow().isoformat(), 1, datetime.utcnow().isoformat()),
+                                    )
+                                    self.conn.commit()
                                 clips_added += 1
                                 logger.info(f"Recorded clip in DB: {reel_path}")
                             except Exception:
@@ -518,10 +523,11 @@ class ReelsManager:
         """Find local reels (under reels/) that are not marked published and publish them.
         Returns the number of reels processed.
         """
-        cur = self.conn.cursor()
-        # find clips rows that are not published and not soft-deleted
-        cur.execute("SELECT id, video_id, reel_path FROM clips WHERE published=0 AND (deleted_at IS NULL OR deleted_at='')")
-        rows = cur.fetchall()
+        with self.db_lock:
+            cur = self.conn.cursor()
+            # find clips rows that are not published and not soft-deleted
+            cur.execute("SELECT id, video_id, reel_path FROM clips WHERE published=0 AND (deleted_at IS NULL OR deleted_at='')")
+            rows = cur.fetchall()
 
         processed = 0
 
@@ -535,8 +541,10 @@ class ReelsManager:
                     for fp in video_dir.glob("*.mp4"):
                         pstr = str(fp)
                         # check if there's a clip row for this path and published=1
-                        cur.execute("SELECT id, published FROM clips WHERE reel_path=?", (pstr,))
-                        r = cur.fetchone()
+                        with self.db_lock:
+                            cur = self.conn.cursor()
+                            cur.execute("SELECT id, published FROM clips WHERE reel_path=?", (pstr,))
+                            r = cur.fetchone()
                         if r is None:
                             rows.append((None, video_dir.name, pstr))
                         else:
@@ -597,18 +605,20 @@ class ReelsManager:
                     now = datetime.utcnow().isoformat()
                     if rid:
                         try:
-                            cur.execute("UPDATE clips SET published=1, published_at=? WHERE id=?", (now, rid))
-                            self.conn.commit()
+                                    with self.db_lock:
+                                        cur.execute("UPDATE clips SET published=1, published_at=? WHERE id=?", (now, rid))
+                                        self.conn.commit()
                         except Exception:
                             logger.exception("Failed marking clip id %s as published", rid)
                     else:
                         try:
                             # insert record
-                            cur.execute(
-                                "INSERT INTO clips (video_id, clip_path, reel_path, duration, drive_file_id, created_at, published, published_at) VALUES (?,?,?,?,?,?,?,?)",
-                                (vid, None, reel_path, None, None, now, 1, now),
-                            )
-                            self.conn.commit()
+                            with self.db_lock:
+                                cur.execute(
+                                    "INSERT INTO clips (video_id, clip_path, reel_path, duration, drive_file_id, created_at, published, published_at) VALUES (?,?,?,?,?,?,?,?)",
+                                    (vid, None, reel_path, None, None, now, 1, now),
+                                )
+                                self.conn.commit()
                         except Exception:
                             logger.exception("Failed inserting clip row for %s", reel_path)
 
@@ -627,9 +637,10 @@ class ReelsManager:
             keep_days = self.cfg.getint("cleanup", "keep_days", fallback=7)
             cutoff = datetime.utcnow() - timedelta(days=keep_days)
 
-            cur = self.conn.cursor()
-            cur.execute("SELECT id, reel_path, clip_path, drive_file_id, created_at FROM clips")
-            rows = cur.fetchall()
+            with self.db_lock:
+                cur = self.conn.cursor()
+                cur.execute("SELECT id, reel_path, clip_path, drive_file_id, created_at FROM clips")
+                rows = cur.fetchall()
 
             for r in rows:
                 cid_db, reel_path, clip_path, drive_id, created_at = r
@@ -665,11 +676,12 @@ class ReelsManager:
                             drive_deleted_flag = 1 if drive_id else 0
                         except Exception:
                             drive_deleted_flag = 0
-                        cur.execute(
-                            "UPDATE clips SET deleted_at=?, drive_deleted=? WHERE id=?",
-                            (datetime.utcnow().isoformat(), drive_deleted_flag, cid_db),
-                        )
-                        self.conn.commit()
+                        with self.db_lock:
+                            cur.execute(
+                                "UPDATE clips SET deleted_at=?, drive_deleted=? WHERE id=?",
+                                (datetime.utcnow().isoformat(), drive_deleted_flag, cid_db),
+                            )
+                            self.conn.commit()
                         logger.info(f"Marked clip row {cid_db} deleted in DB")
                     except Exception:
                         logger.exception("Failed marking clip row %s as deleted", cid_db)
@@ -697,6 +709,12 @@ def main():
     cfg = load_settings(ROOT / "settings.ini")
     rm = ReelsManager(cfg)
 
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--once", action="store_true", help="Run both jobs once and exit")
+    p.add_argument("--disable-interaction", action="store_true", help="Disable responding to DMs/comments")
+    args = p.parse_args()
+
     scheduler = BackgroundScheduler()
 
     search_cron = cfg.get("scheduler", "search_cron", fallback="*/15 * * * *")
@@ -704,18 +722,19 @@ def main():
     cleanup_cron = cfg.get("cleanup", "cleanup_cron", fallback="0 0 */3 * *")
 
     scheduler.add_job(rm.search_download_publish, CronTrigger.from_crontab(search_cron), id="search_job")
-    scheduler.add_job(rm.respond_interactions, CronTrigger.from_crontab(interact_cron), id="interact_job")
+    if not args.disable_interaction:
+        scheduler.add_job(rm.respond_interactions, CronTrigger.from_crontab(interact_cron), id="interact_job")
+    else:
+        logger.info("Interactions disabled by CLI flag; not scheduling respond_interactions job")
     scheduler.add_job(rm.cleanup_storage, CronTrigger.from_crontab(cleanup_cron), id="cleanup_job")
 
-    run_once = False
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--once", action="store_true", help="Run both jobs once and exit")
-    args = p.parse_args()
     if args.once:
-        logger.info("Running both jobs once (cli --once)")
+        logger.info("Running jobs once (cli --once)")
         rm.search_download_publish()
-        rm.respond_interactions()
+        if not args.disable_interaction:
+            rm.respond_interactions()
+        else:
+            logger.info("Interactions disabled by CLI flag; skipping respond_interactions run")
         return
 
     scheduler.start()
