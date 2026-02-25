@@ -24,7 +24,6 @@ from src.ClipBuilder import ClipBuilder
 from src.DriveHandler import GoogleDriveManager
 from src.InstagramHandler import InstagramHandler
 from src.SupabaseS3Handler import SupabaseS3Handler
-from moviepy import VideoFileClip
 
 DB_PATH = ROOT / "reels_manager.db"
 LOG_PATH = ROOT / "reels_manager.log"
@@ -321,7 +320,6 @@ class ReelsManager:
 
                                 duration = None
                                 try:
-                                    from moviepy.editor import VideoFileClip
                                     with VideoFileClip(reel_path) as vfc:
                                         duration = float(vfc.duration)
                                 except Exception:
@@ -347,7 +345,6 @@ class ReelsManager:
                             caption = self.reels_caption.format(video_id=video_id, title=(video.get("title") if isinstance(video, dict) else ""))
                             # Step 1: create resumable media container
                             try:
-                                from moviepy import VideoFileClip
                                 
                                 video = VideoFileClip(reel_path)
                                 duration = int(video.duration)
@@ -411,7 +408,6 @@ class ReelsManager:
                                 # try to get duration using moviepy if available
                                 duration = None
                                 try:
-                                    from moviepy.editor import VideoFileClip
                                     with VideoFileClip(reel_path) as vfc:
                                         duration = float(vfc.duration)
                                 except Exception:

@@ -8,7 +8,7 @@ GraphAPI.ini
 garbage/
 credentials.json
 token.pickle
-/__pycache__
+**/__pycache__
 *_test.py
 *.ipynb
 
