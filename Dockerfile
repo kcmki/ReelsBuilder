@@ -13,11 +13,13 @@ RUN apt-get update \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# copy requirements and install Python deps
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# copy whole repo into an image-only path so we can initialize volumes from it
+COPY . /usr/src/app
 
-# copy app
+# install Python deps from the image copy
+RUN pip install --no-cache-dir -r /usr/src/app/requirements.txt
+
+# copy runtime files into /app (this will be the container runtime working dir)
 COPY . /app
 
 # entrypoint

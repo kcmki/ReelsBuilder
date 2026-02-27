@@ -6,14 +6,19 @@ services:
     env_file:
       - .env
     volumes:
-      - ./:/app
       - ./clips:/app/clips
       - ./reels:/app/reels
       - ./temp:/app/temp
       - ./logs:/app/logs
+      - reelsbuilder_data:/app/data
+      - reelsbuilder_db:/app/db
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "pgrep", "-f", "run_manager.py"]
       interval: 30s
       timeout: 10s
       retries: 3
+
+volumes:
+  reelsbuilder_data:
+  reelsbuilder_db:
