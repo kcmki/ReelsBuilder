@@ -20,11 +20,21 @@ routing:
   domain: reels.mekki.tech
 
 environment:
+  # dashboard
   - SESSION_SECRET
-  - INTERNAL_API_URL
-  - DASHBOARD_DB_PATH
-  - DB_PATH
-  - LOG_PATH
+  # instagram / meta graph api (reelsbuilder)
+  - APP_ID
+  - APP_SECRET
+  - USER_TOKEN
+  - FB_PAGE_ID
+  - INSTAGRAM_BUISINESS_ACCOUNT
+  - LONG_TIME_ACCESS_TOKEN
+  # supabase s3 (optional — only if SupabaseS3Handler is used)
+  - endpoint
+  - key_id
+  - secret_key
+  - SUPABASE_REGION
+  - SUPABASE_PUBLIC_BASE
 
 labels:
   type: backend
