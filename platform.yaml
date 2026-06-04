@@ -1,0 +1,32 @@
+name: reels-dashboard
+enabled: true
+
+deployment:
+  auto_deploy: true
+  branches:
+    - main
+
+build:
+  strategy: compose
+  compose_file: docker-compose.yml
+  service: reels-dashboard   # only this service gets Traefik routing; reelsbuilder runs alongside
+
+runtime:
+  internal_port: 8000
+  healthcheck: /health
+  restart_policy: unless-stopped
+
+routing:
+  domain: reels.mekki.tech
+
+environment:
+  - SESSION_SECRET
+  - INTERNAL_API_URL
+  - DASHBOARD_DB_PATH
+  - DB_PATH
+  - LOG_PATH
+
+labels:
+  type: backend
+  language: python
+  team: personal

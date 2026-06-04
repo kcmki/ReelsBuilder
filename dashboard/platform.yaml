@@ -1,9 +1,0 @@
-name: reels-dashboard
-subdomain: reels
-port: 8000
-strategy: docker
-health_check: /health
-environment:
-  - SESSION_SECRET
-  - INTERNAL_API_URL
-  - DASHBOARD_DB_PATH
