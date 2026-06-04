@@ -11,6 +11,10 @@ RUN apt-get update \
         libgl1 \
         libglib2.0-0 \
         ca-certificates \
+        dos2unix \
+        procps \
+        sqlite3 \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 # copy whole repo into an image-only path so we can initialize volumes from it
@@ -24,7 +28,8 @@ COPY . /app
 
 # entrypoint
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh && dos2unix /app/docker-entrypoint.sh
+RUN [ -f /app/.env ] && dos2unix /app/.env || true
 
 # basic healthcheck: ensures the manager process is running
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \

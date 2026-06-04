@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">Settings</div>
+  <div class="page-subtitle">Edits are written to settings.ini and hot-reloaded into the scheduler</div>
+</div>
+
+{% if saved %}<div class="alert alert-success" role="status">Settings saved and reloaded.</div>{% endif %}
+{% if error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}
+
+<form method="post" action="/settings">
+  {% for section, values in cfg.items() %}
+  <div class="card form-section" style="margin-bottom:16px">
+    <div class="form-section-title">{{ section }}</div>
+    {% for key, value in values.items() %}
+    <div class="form-group">
+      <label class="form-label" for="{{ section }}__{{ key }}">{{ key }}</label>
+      {% if key in textarea_keys %}
+      <textarea id="{{ section }}__{{ key }}" name="{{ section }}__{{ key }}">{{ value }}</textarea>
+      {% else %}
+      <input type="text" id="{{ section }}__{{ key }}" name="{{ section }}__{{ key }}" value="{{ value }}">
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endfor %}
+  {% if not cfg %}
+  <div class="card" style="color:var(--fg-muted);font-size:13px">
+    Cannot reach the reelsbuilder API. Is the container running?
+  </div>
+  {% else %}
+  <button type="submit" class="btn btn-primary">Save Settings</button>
+  {% endif %}
+</form>
+
+{% endblock %}

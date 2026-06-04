@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Jobs{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">Jobs</div>
+  <div class="page-subtitle">Trigger and control scheduled automation jobs</div>
+</div>
+
+<div id="job-feedback" style="min-height:36px" aria-live="polite"></div>
+
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Job</th><th>Next Run</th><th>Trigger</th><th style="width:200px">Actions</th></tr>
+      </thead>
+      <tbody>
+        {% for job in jobs %}
+        <tr>
+          <td>
+            {{ job.label }}
+            {% if job.id == 'interact_job' %}
+              <span id="interact-badge" class="badge {% if interactions_enabled %}badge-green{% else %}badge-gray{% endif %}" style="margin-left:8px">
+                {% if interactions_enabled %}Enabled{% else %}Disabled{% endif %}
+              </span>
+            {% endif %}
+          </td>
+          <td>{{ job.next_run_time or '—' }}</td>
+          <td style="color:var(--fg-muted);max-width:200px;overflow:hidden;text-overflow:ellipsis">{{ job.trigger or '—' }}</td>
+          <td>
+            <div style="display:flex;gap:8px;align-items:center">
+              <button class="btn btn-primary btn-sm"
+                hx-post="/jobs/{{ job.id }}/run"
+                hx-target="#job-feedback"
+                hx-swap="innerHTML"
+                hx-indicator="#spin-{{ job.id }}">
+                Run Now <span id="spin-{{ job.id }}" class="htmx-indicator" aria-hidden="true">…</span>
+              </button>
+              {% if job.id == 'interact_job' %}
+              <button class="btn btn-ghost btn-sm"
+                hx-post="/jobs/interact_job/toggle"
+                hx-target="#interact-badge"
+                hx-swap="outerHTML">
+                Toggle
+              </button>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+        {% if not jobs %}
+        <tr><td colspan="4" style="text-align:center;color:var(--fg-muted);padding:24px">No jobs — is the reelsbuilder running?</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

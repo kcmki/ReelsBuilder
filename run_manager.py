@@ -11,6 +11,7 @@ import configparser
 from typing import List
 import time
 import threading
+import uvicorn
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from moviepy import VideoFileClip
@@ -25,15 +26,36 @@ from src.DriveHandler import GoogleDriveManager
 from src.InstagramHandler import InstagramHandler
 from src.SupabaseS3Handler import SupabaseS3Handler
 
-DB_PATH = ROOT / "reels_manager.db"
-LOG_PATH = ROOT / "reels_manager.log"
+DB_PATH = Path(os.getenv("DB_PATH", str(ROOT / "reels_manager.db")))
+LOG_PATH = Path(os.getenv("LOG_PATH", str(ROOT / "reels_manager.log")))
 
 logger = logging.getLogger("reels_manager")
 logger.setLevel(logging.INFO)
+# ensure log directory exists
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
 handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(handler)
 logger.addHandler(logging.StreamHandler())
+
+def delete_local_files(*paths, label="after upload"):
+    """Helper to delete local video files and empty parent directories."""
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+                logger.info(f"Deleted local file {label}: {p}")
+                
+                # Try to remove parent directory if it's empty (e.g. clips/video_id/)
+                parent = os.path.dirname(p)
+                if os.path.exists(parent) and not os.listdir(parent):
+                    # check if it's within clips or reels to avoid deleting root folders
+                    parent_name = os.path.basename(os.path.dirname(parent))
+                    if parent_name in ("clips", "reels"):
+                        os.rmdir(parent)
+                        logger.info(f"Deleted empty directory: {parent}")
+        except Exception:
+            logger.exception(f"Failed deleting local file or directory {p}")
 
 
 def init_db(conn: sqlite3.Connection):
@@ -300,6 +322,9 @@ class ReelsManager:
                     reels_dir.mkdir(parents=True, exist_ok=True)
 
                     cb.build_reels_from_points(points, clips_dir=str(clips_dir), reels_dir=str(reels_dir))
+                    
+                    # delete the base video immediately after reels are created to save space and avoid reuse
+                    delete_local_files(str(temp_video_path), label="after clipping")
 
                     # collect reels and upload each to drive and make public; record each clip in DB
                     reels = sorted(reels_dir.glob("*.mp4"))
@@ -318,18 +343,15 @@ class ReelsManager:
                                 clip_path = str(clips_dir / orig_clip_name)
                                 reel_path = str(reel)
 
-                                duration = None
-                                try:
-                                    with VideoFileClip(reel_path) as vfc:
-                                        duration = float(vfc.duration)
-                                except Exception:
-                                    duration = None
+                                # Store relative paths in DB for portability
+                                clip_rel_path = os.path.relpath(clip_path, ROOT)
+                                reel_rel_path = os.path.relpath(reel_path, ROOT)
 
                                 with self.db_lock:
                                     cur = self.conn.cursor()
                                     cur.execute(
                                         "INSERT INTO clips (video_id, clip_path, reel_path, duration, drive_file_id, created_at, published, published_at) VALUES (?,?,?,?,?,?,?,?)",
-                                        (video_id, clip_path, reel_path, duration, None, datetime.utcnow().isoformat(), 0, None),
+                                        (video_id, clip_rel_path, reel_rel_path, duration, None, datetime.utcnow().isoformat(), 0, None),
                                     )
                                     self.conn.commit()
                                 clips_added += 1
@@ -413,31 +435,34 @@ class ReelsManager:
                                 except Exception:
                                     duration = None
 
+                                # Store relative paths in DB for portability
+                                clip_rel_path = os.path.relpath(clip_path, ROOT)
+                                reel_rel_path = os.path.relpath(reel_path, ROOT)
+
                                 with self.db_lock:
                                     cur = self.conn.cursor()
                                     cur.execute(
                                         "INSERT INTO clips (video_id, clip_path, reel_path, duration, drive_file_id, created_at, published, published_at) VALUES (?,?,?,?,?,?,?,?)",
-                                        (video_id, clip_path, reel_path, duration, None, datetime.utcnow().isoformat(), 1, datetime.utcnow().isoformat()),
+                                        (video_id, clip_rel_path, reel_rel_path, duration, None, datetime.utcnow().isoformat(), 1, datetime.utcnow().isoformat()),
                                     )
                                     self.conn.commit()
                                 clips_added += 1
                                 logger.info(f"Recorded clip in DB: {reel_path}")
+                                # delete local files after successful upload
+                                delete_local_files(reel_path, clip_path)
+
+                                # we uploaded/published one reel this run; stop further processing to avoid flooding
+                                uploads_done += 1
+                                stop_all = True
+                                break
                             except Exception:
                                 logger.exception("Failed recording clip metadata for %s", reel)
                                 
                         except Exception:
                             logger.exception(f"Failed upload/publish for {reel}")
 
-                        # we uploaded/published one reel this run; stop further processing to avoid flooding
-                        uploads_done += 1
-                        stop_all = True
-                        break
-
-                    if stop_all:
-                        # break out to stop processing more reels/videos this run
-                        break
-
                     # update video record with clips count and last metadata
+                    # WE DO THIS BEFORE THE BREAK to ensure the video is marked as processed
                     try:
                         self.mark_video(
                             video_id,
@@ -449,6 +474,10 @@ class ReelsManager:
                         )
                     except Exception:
                         logger.exception("Failed updating video record for %s", video_id)
+
+                    if stop_all:
+                        # break out to stop processing more reels/videos this run
+                        break
 
                 except Exception:
                     logger.exception(f"Failed processing video {video_id}")
@@ -536,10 +565,12 @@ class ReelsManager:
                         continue
                     for fp in video_dir.glob("*.mp4"):
                         pstr = str(fp)
+                        rel_pstr = os.path.relpath(fp, ROOT)
                         # check if there's a clip row for this path and published=1
+                        # check both absolute and relative for backward compatibility
                         with self.db_lock:
                             cur = self.conn.cursor()
-                            cur.execute("SELECT id, published FROM clips WHERE reel_path=?", (pstr,))
+                            cur.execute("SELECT id, published FROM clips WHERE reel_path=? OR reel_path=?", (pstr, rel_pstr))
                             r = cur.fetchone()
                         if r is None:
                             rows.append((None, video_dir.name, pstr))
@@ -612,13 +643,15 @@ class ReelsManager:
                             with self.db_lock:
                                 cur.execute(
                                     "INSERT INTO clips (video_id, clip_path, reel_path, duration, drive_file_id, created_at, published, published_at) VALUES (?,?,?,?,?,?,?,?)",
-                                    (vid, None, reel_path, None, None, now, 1, now),
+                                    (vid, None, os.path.relpath(reel_path, ROOT), None, None, now, 1, now),
                                 )
                                 self.conn.commit()
                         except Exception:
                             logger.exception("Failed inserting clip row for %s", reel_path)
 
                     processed += 1
+                    # delete local files after successful upload
+                    delete_local_files(reel_path)
                     # only publish one reel per run to avoid flooding
                     return processed
                 except Exception:
@@ -648,13 +681,24 @@ class ReelsManager:
                 # delete if older than cutoff
                 if created_dt and created_dt < cutoff:
                     # delete local files
+                    # paths in DB might be relative or absolute
                     for p in (reel_path, clip_path):
+                        if not p: continue
+                        abs_p = p if os.path.isabs(p) else str(ROOT / p)
                         try:
-                            if p and os.path.exists(p):
-                                os.remove(p)
-                                logger.info(f"Deleted local file {p}")
+                            if os.path.exists(abs_p):
+                                os.remove(abs_p)
+                                logger.info(f"Deleted local file {abs_p}")
+                                
+                                # Try to remove parent directory if it's empty
+                                parent = os.path.dirname(abs_p)
+                                if os.path.exists(parent) and not os.listdir(parent):
+                                    parent_name = os.path.basename(os.path.dirname(parent))
+                                    if parent_name in ("clips", "reels"):
+                                        os.rmdir(parent)
+                                        logger.info(f"Deleted empty directory: {parent}")
                         except Exception:
-                            logger.exception(f"Failed deleting local file {p}")
+                            logger.exception(f"Failed deleting local file {abs_p}")
 
                     # delete drive file if present
                     if drive_id:
@@ -712,6 +756,18 @@ def main():
     args = p.parse_args()
 
     scheduler = BackgroundScheduler()
+    rm.scheduler = scheduler  # expose to internal API
+
+    # start internal API sidecar (daemon thread — dies with main process)
+    from src.api import create_app, set_manager
+    set_manager(rm)
+    _api_app = create_app()
+
+    def _run_sidecar():
+        uvicorn.run(_api_app, host="0.0.0.0", port=8080, log_level="warning")
+
+    threading.Thread(target=_run_sidecar, daemon=True, name="internal-api").start()
+    logger.info("Internal API sidecar started on :8080")
 
     search_cron = cfg.get("scheduler", "search_cron", fallback="*/15 * * * *")
     interact_cron = cfg.get("scheduler", "interactions_cron", fallback="*/5 * * * *")

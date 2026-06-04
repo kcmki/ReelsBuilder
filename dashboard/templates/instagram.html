@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Instagram{% endblock %}
+{% block content %}
+
+<div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap">
+  <div>
+    <div class="page-title">Instagram</div>
+    <div class="page-subtitle">Published reels and interaction history</div>
+  </div>
+  <button class="btn btn-ghost btn-sm"
+    hx-post="/instagram/sync"
+    hx-target="#sync-result"
+    hx-swap="innerHTML"
+    hx-indicator="#sync-spin">
+    Sync from Instagram <span id="sync-spin" class="htmx-indicator" aria-hidden="true">…</span>
+  </button>
+</div>
+
+<div id="sync-result" style="min-height:12px" aria-live="polite"></div>
+
+<div class="card" style="margin-bottom:16px">
+  <div class="form-section-title">Published Reels (local DB)</div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Video ID</th><th>Published At</th><th>Duration</th></tr></thead>
+      <tbody>
+        {% for c in published %}
+        <tr>
+          <td>{{ c.video_id }}</td>
+          <td>{{ c.published_at[:16] if c.published_at else '—' }}</td>
+          <td>{{ "%.1f"|format(c.duration) if c.duration else '—' }}s</td>
+        </tr>
+        {% endfor %}
+        {% if not published %}
+        <tr><td colspan="3" style="text-align:center;color:var(--fg-muted);padding:24px">No published reels yet</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <div class="form-section-title">Interaction History</div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>Platform</th><th>External ID</th><th>Replied At</th><th>Payload</th></tr></thead>
+      <tbody>
+        {% for i in interactions.items %}
+        <tr>
+          <td><span class="badge {% if i.type == 'replied' %}badge-green{% elif i.type == 'synced' %}badge-warn{% else %}badge-gray{% endif %}">{{ i.type }}</span></td>
+          <td>{{ i.platform }}</td>
+          <td>{{ i.external_id }}</td>
+          <td>{{ i.replied_at[:16] if i.replied_at else '—' }}</td>
+          <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ i.payload or '' }}">{{ i.payload or '—' }}</td>
+        </tr>
+        {% endfor %}
+        {% if not interactions.items %}
+        <tr><td colspan="5" style="text-align:center;color:var(--fg-muted);padding:24px">No interactions recorded yet</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+  <div class="pagination">
+    {% if page > 1 %}<a href="/instagram?page={{ page-1 }}" class="btn btn-ghost btn-sm">← Prev</a>{% endif %}
+    <span style="color:var(--fg-muted);font-size:12px">Page {{ page }} · {{ interactions.total }} total</span>
+    {% if page * 20 < interactions.total %}<a href="/instagram?page={{ page+1 }}" class="btn btn-ghost btn-sm">Next →</a>{% endif %}
+  </div>
+</div>
+
+{% endblock %}

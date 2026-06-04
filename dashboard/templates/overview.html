@@ -1,0 +1,74 @@
+{% if not partial %}{% extends "base.html" %}{% block title %}Overview{% endblock %}{% block content %}{% endif %}
+
+<div class="page-header">
+  <div class="page-title">Overview</div>
+  <div class="page-subtitle">Scheduler and automation status</div>
+</div>
+
+<div id="overview-content"
+  hx-get="/overview/refresh"
+  hx-trigger="every 10s"
+  hx-swap="outerHTML">
+
+  <div class="card-grid">
+    <div class="card">
+      <div class="stat-label">Scheduler</div>
+      <div style="margin-top:8px">
+        {% if status.get('scheduler_running') %}
+          <span class="badge badge-green">Running</span>
+        {% else %}
+          <span class="badge badge-red">Stopped</span>
+        {% endif %}
+      </div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Interactions</div>
+      <div style="margin-top:8px">
+        {% if status.get('interactions_enabled') %}
+          <span class="badge badge-green">Enabled</span>
+        {% else %}
+          <span class="badge badge-gray">Disabled</span>
+        {% endif %}
+      </div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Videos Processed</div>
+      <div class="stat-value">{{ total_videos }}</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Clips Published</div>
+      <div class="stat-value">{{ total_clips }}</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Interactions Logged</div>
+      <div class="stat-value">{{ total_interactions }}</div>
+    </div>
+  </div>
+
+  {% if status.get('jobs') %}
+  <div class="card">
+    <div class="form-section-title">Upcoming Runs</div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Job</th><th>Next Run</th><th>Trigger</th></tr></thead>
+        <tbody>
+          {% for job in status['jobs'] %}
+          <tr>
+            <td>{{ job.id }}</td>
+            <td>{{ job.next_run_time or '—' }}</td>
+            <td style="color:var(--fg-muted)">{{ job.trigger or '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% else %}
+  <div class="card" style="color:var(--fg-muted);font-size:13px">
+    No job data — is the reelsbuilder container running?
+  </div>
+  {% endif %}
+
+</div>
+
+{% if not partial %}{% endblock %}{% endif %}

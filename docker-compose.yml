@@ -5,20 +5,59 @@ services:
     container_name: reelsbuilder
     env_file:
       - .env
+    environment:
+      - DB_PATH=/app/db/reels_manager.db
+      - LOG_PATH=/app/logs/reels_manager.log
     volumes:
       - ./clips:/app/clips
       - ./reels:/app/reels
       - ./temp:/app/temp
-      - ./logs:/app/logs
+      - reelsbuilder_logs:/app/logs
       - reelsbuilder_data:/app/data
       - reelsbuilder_db:/app/db
     restart: unless-stopped
+    networks:
+      - platform-network
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "run_manager.py"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
 
+  reels-dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: reels-dashboard
+    env_file:
+      - .env
+    environment:
+      - INTERNAL_API_URL=http://reelsbuilder:8080
+      - DASHBOARD_DB_PATH=/app/db/dashboard.db
+    volumes:
+      - dashboard_db:/app/db
+    restart: unless-stopped
+    networks:
+      - platform-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.reels-dashboard.rule=Host(`reels.mekki.tech`)"
+      - "traefik.http.routers.reels-dashboard.entrypoints=web"
+      - "traefik.http.services.reels-dashboard.loadbalancer.server.port=8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - reelsbuilder
+
 volumes:
   reelsbuilder_data:
   reelsbuilder_db:
+  reelsbuilder_logs:
+  dashboard_db:
+
+networks:
+  platform-network:
+    external: true

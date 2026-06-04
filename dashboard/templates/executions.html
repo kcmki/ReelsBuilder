@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}Executions{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">Executions</div>
+  <div class="page-subtitle">Videos processed and clips published</div>
+</div>
+
+<div style="display:flex;gap:8px;margin-bottom:16px">
+  <a href="/executions?tab=videos&page=1" class="btn {% if tab == 'videos' %}btn-primary{% else %}btn-ghost{% endif %} btn-sm">Videos</a>
+  <a href="/executions?tab=clips&page=1"  class="btn {% if tab == 'clips'  %}btn-primary{% else %}btn-ghost{% endif %} btn-sm">Clips</a>
+</div>
+
+{% if tab == 'videos' %}
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Video ID</th><th>Title</th><th>Downloaded</th><th>Clips</th><th>IG Media ID</th></tr></thead>
+      <tbody>
+        {% for v in videos.items %}
+        <tr>
+          <td><a href="https://youtube.com/watch?v={{ v.video_id }}" target="_blank" rel="noopener noreferrer">{{ v.video_id }}</a></td>
+          <td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ v.title or '' }}">{{ v.title or '—' }}</td>
+          <td>{{ v.downloaded_at[:16] if v.downloaded_at else '—' }}</td>
+          <td>{{ v.clips_created or 0 }}</td>
+          <td>{{ v.instagram_media_id or '—' }}</td>
+        </tr>
+        {% endfor %}
+        {% if not videos.items %}
+        <tr><td colspan="5" style="text-align:center;color:var(--fg-muted);padding:24px">No videos yet</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+  <div class="pagination">
+    {% if page > 1 %}<a href="/executions?tab=videos&page={{ page-1 }}" class="btn btn-ghost btn-sm">← Prev</a>{% endif %}
+    <span style="color:var(--fg-muted);font-size:12px">Page {{ page }} · {{ videos.total }} total</span>
+    {% if page * 20 < videos.total %}<a href="/executions?tab=videos&page={{ page+1 }}" class="btn btn-ghost btn-sm">Next →</a>{% endif %}
+  </div>
+</div>
+{% endif %}
+
+{% if tab == 'clips' %}
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>Video ID</th><th>Duration</th><th>Status</th><th>Published</th><th>Created</th></tr></thead>
+      <tbody>
+        {% for c in clips.items %}
+        <tr>
+          <td>{{ c.id }}</td>
+          <td>{{ c.video_id }}</td>
+          <td>{{ "%.1f"|format(c.duration) if c.duration else '—' }}s</td>
+          <td>
+            {% if c.deleted_at %}
+              <span class="badge badge-gray">Deleted</span>
+            {% elif c.published %}
+              <span class="badge badge-green">Published</span>
+            {% else %}
+              <span class="badge badge-warn">Pending</span>
+            {% endif %}
+          </td>
+          <td>{{ c.published_at[:16] if c.published_at else '—' }}</td>
+          <td>{{ c.created_at[:16] if c.created_at else '—' }}</td>
+        </tr>
+        {% endfor %}
+        {% if not clips.items %}
+        <tr><td colspan="6" style="text-align:center;color:var(--fg-muted);padding:24px">No clips yet</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+  <div class="pagination">
+    {% if page > 1 %}<a href="/executions?tab=clips&page={{ page-1 }}" class="btn btn-ghost btn-sm">← Prev</a>{% endif %}
+    <span style="color:var(--fg-muted);font-size:12px">Page {{ page }} · {{ clips.total }} total</span>
+    {% if page * 20 < clips.total %}<a href="/executions?tab=clips&page={{ page+1 }}" class="btn btn-ghost btn-sm">Next →</a>{% endif %}
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

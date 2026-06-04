@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Logs{% endblock %}
+{% block content %}
+
+<div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap">
+  <div>
+    <div class="page-title">Live Logs</div>
+    <div class="page-subtitle">Real-time stream from reels_manager.log</div>
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap" role="group" aria-label="Log filter">
+    <button class="btn btn-ghost btn-sm" onclick="filterLogs('ALL')">All</button>
+    <button class="btn btn-ghost btn-sm" onclick="filterLogs('INFO')">Info</button>
+    <button class="btn btn-ghost btn-sm" onclick="filterLogs('WARNING')">Warn</button>
+    <button class="btn btn-ghost btn-sm" onclick="filterLogs('ERROR')">Error</button>
+    <button class="btn btn-ghost btn-sm" onclick="document.getElementById('log-viewer').innerHTML=''">Clear</button>
+  </div>
+</div>
+
+<div id="log-viewer"
+  class="log-viewer"
+  role="log"
+  aria-live="polite"
+  aria-label="Application logs"
+  hx-ext="sse"
+  sse-connect="/logs/stream"
+  sse-swap="message"
+  hx-swap="beforeend"
+  hx-on::sse-message="onLogLine(event)">
+</div>
+
+<script>
+function onLogLine(event) {
+  const viewer = document.getElementById('log-viewer');
+  const last = viewer.lastElementChild;
+  if (!last) return;
+  const t = last.textContent;
+  let level = 'INFO';
+  if (t.includes('CRITICAL')) level = 'CRITICAL';
+  else if (t.includes(' ERROR ') || t.includes('ERROR:')) level = 'ERROR';
+  else if (t.includes(' WARNING ') || t.includes('WARNING:')) level = 'WARNING';
+  last.classList.add('log-line', level);
+  last.dataset.level = level;
+  if (_activeFilter !== 'ALL' && level !== _activeFilter) last.style.display = 'none';
+  viewer.scrollTop = viewer.scrollHeight;
+}
+
+let _activeFilter = 'ALL';
+function filterLogs(level) {
+  _activeFilter = level;
+  document.querySelectorAll('.log-line').forEach(el => {
+    el.style.display = (level === 'ALL' || el.dataset.level === level) ? '' : 'none';
+  });
+}
+</script>
+
+{% endblock %}
