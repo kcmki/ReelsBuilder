@@ -26,8 +26,8 @@ services:
 
   reels-dashboard:
     build:
-      context: .
-      dockerfile: dashboard/Dockerfile
+      context: ./dashboard
+      dockerfile: Dockerfile
     container_name: reels-dashboard
     env_file:
       - .env

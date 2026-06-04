@@ -3,6 +3,8 @@ GraphAPI.ini
 
 **.7z
 **.txt
+!dashboard/requirements.txt
+!requirements.txt
 
 .env
 garbage/
