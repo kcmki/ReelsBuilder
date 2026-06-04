@@ -29,12 +29,6 @@ environment:
   - FB_PAGE_ID
   - INSTAGRAM_BUISINESS_ACCOUNT
   - LONG_TIME_ACCESS_TOKEN
-  # supabase s3 (optional — only if SupabaseS3Handler is used)
-  - endpoint
-  - key_id
-  - secret_key
-  - SUPABASE_REGION
-  - SUPABASE_PUBLIC_BASE
 
 labels:
   type: backend
