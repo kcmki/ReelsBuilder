@@ -25,8 +25,8 @@ class InstagramHandler:
         self.env_path = env_path
         load_dotenv(env_path)
 
-        self.app_id = os.getenv("APP_ID")
-        self.app_secret = os.getenv("APP_SECRET")
+        self.app_id = os.getenv("APP_ID") or os.getenv("App_id")
+        self.app_secret = os.getenv("APP_SECRET") or os.getenv("App_secret")
         self.user_token = os.getenv("USER_TOKEN")
         self.page_id = os.getenv("FB_PAGE_ID")
         self.ig_business_id = os.getenv("INSTAGRAM_BUISINESS_ACCOUNT")

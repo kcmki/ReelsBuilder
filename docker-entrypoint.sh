@@ -27,5 +27,11 @@ for d in data db clips reels temp logs; do
   fi
 done
 
+# Specifically handle the database file if it exists in the root of the image copy
+if [ ! -f /app/db/reels_manager.db ] && [ -f /usr/src/app/reels_manager.db ]; then
+  echo "Initializing database from image default"
+  cp /usr/src/app/reels_manager.db /app/db/reels_manager.db
+fi
+
 # run manager (it uses APScheduler and runs indefinitely)
-exec python /app/run_manager.py
+exec python /app/run_manager.py --disable-interaction

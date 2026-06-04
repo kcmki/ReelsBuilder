@@ -34,18 +34,33 @@ class ClipBuilder:
         min_duration: int = 20,
     ) -> List[str]:
         """
-        Cut clips from a downloaded video using ffmpeg.
+        Cut clips from a downloaded video using ffmpeg, ensuring no overlaps.
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         generated_clips = []
+        
+        # Sort points by start time to handle overlap detection linearly
+        sorted_points = sorted(points, key=lambda x: int(x.get("startMillis", 0)))
+        
+        last_end_time = 0.0
 
-        for idx, point in enumerate(points):
-            start_time = int(point["startMillis"]) / 1000
+        for idx, point in enumerate(sorted_points):
+            intended_start = int(point["startMillis"]) / 1000
             duration = max(int(point["durationMillis"]) / 1000, min_duration)
-
+            
+            # Ensure we don't start before the previous clip ended
+            start_time = max(intended_start, last_end_time)
+            
+            # If the intended start was adjusted, we should check if there's still room for a clip
+            # or if we should just shift the duration. 
+            # To keep it simple and ensure no overlap:
+            end_time = start_time + duration
+            
             output_file = output_dir / f"clip_{idx + 1}.mp4"
+
+            print(f"Generating clip {idx+1}: start={start_time}s, duration={duration}s (intended start was {intended_start}s)")
 
             command = [
                 "ffmpeg",
@@ -58,8 +73,13 @@ class ClipBuilder:
                 str(output_file),
             ]
 
-            subprocess.run(command, check=True)
-            generated_clips.append(str(output_file))
+            try:
+                subprocess.run(command, check=True, capture_output=True)
+                generated_clips.append(str(output_file))
+                last_end_time = end_time
+            except subprocess.CalledProcessError as e:
+                print(f"Error generating clip {idx+1}: {e.stderr.decode()}")
+                continue
 
         return generated_clips
 
