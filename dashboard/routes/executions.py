@@ -27,7 +27,7 @@ def executions_page(
     except Exception:
         clips = {"items": [], "total": 0, "page": 1}
 
-    return templates.TemplateResponse("executions.html", {
-        "request": request, "active": "executions", "user": user,
+    return templates.TemplateResponse(request, "executions.html", {
+        "active": "executions", "user": user,
         "tab": tab, "videos": videos, "clips": clips, "page": page,
     })

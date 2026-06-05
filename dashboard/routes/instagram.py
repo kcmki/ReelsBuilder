@@ -23,8 +23,8 @@ def instagram_page(request: Request, user: str = Depends(require_auth), page: in
     except Exception:
         interactions = {"items": [], "total": 0, "page": 1}
 
-    return templates.TemplateResponse("instagram.html", {
-        "request": request, "active": "instagram", "user": user,
+    return templates.TemplateResponse(request, "instagram.html", {
+        "active": "instagram", "user": user,
         "published": published, "interactions": interactions, "page": page,
     })
 

@@ -14,8 +14,8 @@ router = APIRouter()
 
 @router.get("/logs", response_class=HTMLResponse)
 def logs_page(request: Request, user: str = Depends(require_auth)):
-    return templates.TemplateResponse("logs.html", {
-        "request": request, "active": "logs", "user": user,
+    return templates.TemplateResponse(request, "logs.html", {
+        "active": "logs", "user": user,
     })
 
 

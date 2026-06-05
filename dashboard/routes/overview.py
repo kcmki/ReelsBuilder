@@ -34,8 +34,8 @@ def _fetch_overview():
 @router.get("/", response_class=HTMLResponse)
 def overview_page(request: Request, user: str = Depends(require_auth)):
     status, tv, tc, ti = _fetch_overview()
-    return templates.TemplateResponse("overview.html", {
-        "request": request, "active": "overview", "user": user,
+    return templates.TemplateResponse(request, "overview.html", {
+        "active": "overview", "user": user,
         "status": status, "total_videos": tv, "total_clips": tc,
         "total_interactions": ti, "partial": False,
     })
@@ -44,8 +44,8 @@ def overview_page(request: Request, user: str = Depends(require_auth)):
 @router.get("/overview/refresh", response_class=HTMLResponse)
 def overview_refresh(request: Request, user: str = Depends(require_auth)):
     status, tv, tc, ti = _fetch_overview()
-    return templates.TemplateResponse("overview.html", {
-        "request": request, "active": "overview", "user": user,
+    return templates.TemplateResponse(request, "overview.html", {
+        "active": "overview", "user": user,
         "status": status, "total_videos": tv, "total_clips": tc,
         "total_interactions": ti, "partial": True,
     })

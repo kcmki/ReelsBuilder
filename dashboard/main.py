@@ -43,15 +43,15 @@ def create_app() -> FastAPI:
     def login_get(request: Request):
         if get_current_user(request):
             return RedirectResponse("/", 302)
-        return templates.TemplateResponse("login.html", {"request": request, "error": None})
+        return templates.TemplateResponse(request, "login.html", {"error": None})
 
     @app.post("/login")
     def login_post(request: Request, username: str = Form(...), password: str = Form(...)):
         user = get_user(username)
         if not user or not verify_password(password, user["password_hash"]):
             return templates.TemplateResponse(
-                "login.html",
-                {"request": request, "error": "Invalid username or password"},
+                request, "login.html",
+                {"error": "Invalid username or password"},
                 status_code=401,
             )
         token = create_session_token(username)
@@ -69,7 +69,7 @@ def create_app() -> FastAPI:
     def setup_get(request: Request):
         if has_users():
             return RedirectResponse("/login", 302)
-        return templates.TemplateResponse("setup.html", {"request": request, "error": None})
+        return templates.TemplateResponse(request, "setup.html", {"error": None})
 
     @app.post("/setup")
     def setup_post(request: Request, username: str = Form(...), password: str = Form(...)):
@@ -77,8 +77,8 @@ def create_app() -> FastAPI:
             return RedirectResponse("/login", 302)
         if len(password) < 8:
             return templates.TemplateResponse(
-                "setup.html",
-                {"request": request, "error": "Password must be at least 8 characters"},
+                request, "setup.html",
+                {"error": "Password must be at least 8 characters"},
                 status_code=400,
             )
         create_user(username, hash_password(password))

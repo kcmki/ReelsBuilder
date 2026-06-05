@@ -19,8 +19,8 @@ def settings_page(request: Request, user: str = Depends(require_auth)):
         cfg = api.get_settings()
     except Exception:
         cfg = {}
-    return templates.TemplateResponse("settings.html", {
-        "request": request, "active": "settings", "user": user,
+    return templates.TemplateResponse(request, "settings.html", {
+        "active": "settings", "user": user,
         "cfg": cfg, "saved": False, "error": None, "textarea_keys": _TEXTAREA_KEYS,
     })
 
@@ -36,8 +36,8 @@ async def settings_save(request: Request, user: str = Depends(require_auth)):
     try:
         api.update_settings(body)
         cfg = api.get_settings()
-        return templates.TemplateResponse("settings.html", {
-            "request": request, "active": "settings", "user": user,
+        return templates.TemplateResponse(request, "settings.html", {
+            "active": "settings", "user": user,
             "cfg": cfg, "saved": True, "error": None, "textarea_keys": _TEXTAREA_KEYS,
         })
     except Exception as e:
@@ -45,7 +45,7 @@ async def settings_save(request: Request, user: str = Depends(require_auth)):
             cfg = api.get_settings()
         except Exception:
             cfg = {}
-        return templates.TemplateResponse("settings.html", {
-            "request": request, "active": "settings", "user": user,
+        return templates.TemplateResponse(request, "settings.html", {
+            "active": "settings", "user": user,
             "cfg": cfg, "saved": False, "error": str(e), "textarea_keys": _TEXTAREA_KEYS,
         }, status_code=500)

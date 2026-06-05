@@ -28,8 +28,8 @@ def jobs_page(request: Request, user: str = Depends(require_auth)):
         interactions_enabled = status.get("interactions_enabled", True)
     except Exception:
         jobs, interactions_enabled = [], True
-    return templates.TemplateResponse("jobs.html", {
-        "request": request, "active": "jobs", "user": user,
+    return templates.TemplateResponse(request, "jobs.html", {
+        "active": "jobs", "user": user,
         "jobs": jobs, "interactions_enabled": interactions_enabled,
     })
 
