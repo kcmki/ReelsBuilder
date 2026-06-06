@@ -315,10 +315,30 @@ class ReelsManager:
                         logger.exception("get_points_concatenated failed")
                         raise Exception("Failed extracting points")
                     if not points:
-                        logger.warning(f"No intensity markers for {video_id} — marking as seen and skipping")
-                        self.mark_video(video_id, title=video.get("title") if isinstance(video, dict) else None, url=url, downloaded_at=datetime.utcnow().isoformat(), clips_created=0)
-                        delete_local_files(str(temp_video_path), label="no markers")
-                        continue
+                        # Fallback: evenly spaced clips across full video duration
+                        try:
+                            with VideoFileClip(str(dl_path)) as vfc:
+                                total_ms = int(vfc.duration * 1000)
+                        except Exception:
+                            logger.warning(f"No markers and can't read duration for {video_id} — skipping")
+                            self.mark_video(video_id, title=video.get("title") if isinstance(video, dict) else None, url=url, downloaded_at=datetime.utcnow().isoformat(), clips_created=0)
+                            delete_local_files(str(temp_video_path), label="no markers")
+                            continue
+                        clips_count = self.cfg.getint("clips", "clips_count", fallback=5)
+                        clip_ms = max(self.cfg.getint("clips", "min_duration", fallback=20), 30) * 1000
+                        spacing_ms = total_ms // (clips_count + 1)
+                        points = [
+                            {"startMillis": spacing_ms * (i + 1), "durationMillis": clip_ms, "intensityScoreNormalized": 1.0}
+                            for i in range(clips_count)
+                            if spacing_ms * (i + 1) + clip_ms <= total_ms
+                        ]
+                        if points:
+                            logger.info(f"No markers for {video_id} — using {len(points)} evenly spaced fallback clips")
+                        else:
+                            logger.warning(f"Video {video_id} too short for fallback clips — skipping")
+                            self.mark_video(video_id, title=video.get("title") if isinstance(video, dict) else None, url=url, downloaded_at=datetime.utcnow().isoformat(), clips_created=0)
+                            delete_local_files(str(temp_video_path), label="too short")
+                            continue
                     # build reels
                     cb = ClipBuilder(temp_video_path=str(dl_path))
                     clips_dir = ROOT / "clips" / video_id
