@@ -18,7 +18,7 @@
     <table>
       <thead><tr><th>Video ID</th><th>Title</th><th>Downloaded</th><th>Clips</th><th>IG Media ID</th></tr></thead>
       <tbody>
-        {% for v in videos.items %}
+        {% for v in videos['items'] %}
         <tr>
           <td><a href="https://youtube.com/watch?v={{ v.video_id }}" target="_blank" rel="noopener noreferrer">{{ v.video_id }}</a></td>
           <td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ v.title or '' }}">{{ v.title or '—' }}</td>
@@ -27,7 +27,7 @@
           <td>{{ v.instagram_media_id or '—' }}</td>
         </tr>
         {% endfor %}
-        {% if not videos.items %}
+        {% if not videos['items'] %}
         <tr><td colspan="5" style="text-align:center;color:var(--fg-muted);padding:24px">No videos yet</td></tr>
         {% endif %}
       </tbody>
@@ -47,7 +47,7 @@
     <table>
       <thead><tr><th>ID</th><th>Video ID</th><th>Duration</th><th>Status</th><th>Published</th><th>Created</th></tr></thead>
       <tbody>
-        {% for c in clips.items %}
+        {% for c in clips['items'] %}
         <tr>
           <td>{{ c.id }}</td>
           <td>{{ c.video_id }}</td>
@@ -65,7 +65,7 @@
           <td>{{ c.created_at[:16] if c.created_at else '—' }}</td>
         </tr>
         {% endfor %}
-        {% if not clips.items %}
+        {% if not clips['items'] %}
         <tr><td colspan="6" style="text-align:center;color:var(--fg-muted);padding:24px">No clips yet</td></tr>
         {% endif %}
       </tbody>

@@ -45,7 +45,7 @@
     <table>
       <thead><tr><th>Type</th><th>Platform</th><th>External ID</th><th>Replied At</th><th>Payload</th></tr></thead>
       <tbody>
-        {% for i in interactions.items %}
+        {% for i in interactions['items'] %}
         <tr>
           <td><span class="badge {% if i.type == 'replied' %}badge-green{% elif i.type == 'synced' %}badge-warn{% else %}badge-gray{% endif %}">{{ i.type }}</span></td>
           <td>{{ i.platform }}</td>
@@ -54,7 +54,7 @@
           <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ i.payload or '' }}">{{ i.payload or '—' }}</td>
         </tr>
         {% endfor %}
-        {% if not interactions.items %}
+        {% if not interactions['items'] %}
         <tr><td colspan="5" style="text-align:center;color:var(--fg-muted);padding:24px">No interactions recorded yet</td></tr>
         {% endif %}
       </tbody>
