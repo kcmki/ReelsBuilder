@@ -102,6 +102,9 @@ class YoutubeExtractorHandler:
         except KeyError:
             print("Markers not found in video data")
             return []
+        if not scores:
+            print("No intensity markers found for this video")
+            return []
         max_intensity_elements = sorted(scores, key=lambda x: x['intensityScoreNormalized'])
         return max_intensity_elements[-top_x:]
 
@@ -126,6 +129,9 @@ class YoutubeExtractorHandler:
                     continue        
         except KeyError:
             print("Markers not found in video data")
+            return []
+        if not scores:
+            print("No intensity markers found for this video")
             return []
 
         # Ensure duration is int

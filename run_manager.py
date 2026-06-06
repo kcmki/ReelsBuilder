@@ -314,6 +314,11 @@ class ReelsManager:
                     except Exception:
                         logger.exception("get_points_concatenated failed")
                         raise Exception("Failed extracting points")
+                    if not points:
+                        logger.warning(f"No intensity markers for {video_id} — marking as seen and skipping")
+                        self.mark_video(video_id, title=video.get("title") if isinstance(video, dict) else None, url=url, downloaded_at=datetime.utcnow().isoformat(), clips_created=0)
+                        delete_local_files(str(temp_video_path), label="no markers")
+                        continue
                     # build reels
                     cb = ClipBuilder(temp_video_path=str(dl_path))
                     clips_dir = ROOT / "clips" / video_id
