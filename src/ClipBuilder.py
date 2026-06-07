@@ -137,11 +137,18 @@ class ClipBuilder:
             # Crop the original clip to center and match the 9:16 aspect ratio
             main_clip = clip.with_effects([vfx.Resize(width=width)]) 
             
-            logo = ImageClip("./logo/logo.png").with_duration(clip.duration)
-            logo = logo.with_effects([vfx.Resize(height=50),vfx.Margin(bottom=10,opacity=0)])
-            
+            logo_path = Path("./logo/logo.png")
+            if self.logo_path and self.logo_path.exists():
+                logo_path = self.logo_path
+            if logo_path.exists():
+                logo = ImageClip(str(logo_path)).with_duration(clip.duration)
+                logo = logo.with_effects([vfx.Resize(height=50), vfx.Margin(bottom=10, opacity=0)])
+                layers = [background_clip, main_clip.with_position(("center", "center")), logo.with_position(("center", "bottom"))]
+            else:
+                layers = [background_clip, main_clip.with_position(("center", "center"))]
+
             # Overlay the main clip on the background clip
-            final_clip = CompositeVideoClip([background_clip, main_clip.with_position(("center", "center")),logo.with_position(("center", "bottom"))])
+            final_clip = CompositeVideoClip(layers)
             
             # Write the final clip to file with a more comprehensive argument for video settings
             final_clip.write_videofile(output_clip, codec="libx264", audio_codec="aac", threads=12, preset='ultrafast',ffmpeg_params=["-movflags", "+faststart"])
