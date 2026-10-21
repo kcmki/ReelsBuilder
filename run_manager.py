@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from src.YoutubeExtractorHandler import YoutubeExtractorHandler
 from src.ClipBuilder import ClipBuilder, coerce_edit, probe
 from src.InstagramHandler import InstagramHandler
+from src import metrics as M
 
 DB_PATH = Path(os.getenv("DB_PATH", str(ROOT / "reels_manager.db")))
 LOG_PATH = Path(os.getenv("LOG_PATH", str(ROOT / "reels_manager.log")))
@@ -92,6 +93,9 @@ def init_db(conn: sqlite3.Connection):
         ("clips", "account_id INTEGER"), ("clips", "title TEXT"), ("clips", "attempts INTEGER DEFAULT 0"),
         ("clips", "error TEXT"), ("clips", "ig_media_id TEXT"),
         ("videos", "account_id INTEGER"), ("interactions", "account_id INTEGER"),
+        # account health, shown in the dashboard and exported as metrics
+        ("accounts", "auth_failed INTEGER DEFAULT 0"), ("accounts", "last_error TEXT"),
+        ("accounts", "last_error_at TEXT"), ("accounts", "last_run_at TEXT"), ("accounts", "last_outcome TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
@@ -107,6 +111,15 @@ def load_settings() -> configparser.ConfigParser:
     return cfg
 
 
+def is_auth_error(e: Exception) -> bool:
+    """Graph API: HTTP 401, or OAuthException code 190 (expired/invalidated token)."""
+    resp = getattr(e, "response", None)
+    if resp is not None and resp.status_code == 401:
+        return True
+    text = str(e).lower()
+    return "access token" in text and ("expired" in text or "invalid" in text)
+
+
 def fill(template: str, **values) -> str:
     """str.format without blowing up on stray braces in user-written captions."""
     for k, v in values.items():
@@ -117,6 +130,7 @@ def fill(template: str, **values) -> str:
 class ReelsManager:
     settings_path, log_path, logo_dir = SETTINGS_PATH, LOG_PATH, LOGO_DIR
     abspath = staticmethod(abspath)
+    is_auth_error = staticmethod(is_auth_error)
 
     def __init__(self, cfg: configparser.ConfigParser):
         self.cfg = cfg
@@ -125,6 +139,7 @@ class ReelsManager:
         self.db_lock = threading.RLock()
         # ponytail: one global render lock — download+ffmpeg is CPU/disk bound on one box anyway
         self.render_lock = threading.Lock()
+        self.run_locks: dict = {}  # account_id -> Lock, so "Run now" can't overlap a scheduled run
         init_db(self.conn)
         self.extractor = YoutubeExtractorHandler()
         self.scheduler: Optional[BackgroundScheduler] = None
@@ -232,6 +247,8 @@ class ReelsManager:
         if account_id:
             self.x(f"UPDATE accounts SET {', '.join(c + '=?' for c in cols.split(', '))} WHERE id=?",
                    (*row, account_id))
+            if data.get("access_token"):  # new token: give it a fresh chance
+                self.x("UPDATE accounts SET auth_failed=0, last_error=NULL WHERE id=?", (account_id,))
         else:
             account_id = self.x(f"INSERT INTO accounts ({cols}, created_at) VALUES ({'?,' * 10}?)",
                                 (*row, now())).lastrowid
@@ -267,25 +284,47 @@ class ReelsManager:
 
     # --- pipeline --------------------------------------------------------------------
     def run_account(self, account_id: int):
-        """Scheduled job: publish one queued reel; if the queue is empty, make new ones first."""
+        """Scheduled job: publish one queued reel; only when the queue is empty, make new ones."""
+        lock = self.run_locks.setdefault(account_id, threading.Lock())
         acc = self.get_account(account_id)
         if not acc or not acc["enabled"]:
             return
         tag = f"[{acc['name']}]"
-        logger.info("%s run started", tag)
+        if not lock.acquire(blocking=False):
+            logger.info("%s run skipped: previous run still in progress", tag)
+            M.RUNS.labels(acc["name"], "busy").inc()
+            return
+        outcome = "failed"
         try:
-            if self.publish_next(acc):
+            logger.info("%s run started", tag)
+            if acc["auth_failed"]:
+                # don't download/render more videos into a queue that can't be published
+                logger.warning("%s run skipped: Instagram access token is invalid, update it on the account page",
+                               tag)
+                outcome = "skipped_auth"
+                return
+            if self.queue_size(account_id):
+                outcome = "published" if self.publish_next(acc) else "publish_failed"
                 return
             for query in acc["queries_list"]:
                 video = self.find_new_video(query)
                 if video and self.process_video(acc, video["video_id"], title=video["title"]):
-                    self.publish_next(acc)
+                    outcome = "published" if self.publish_next(self.get_account(account_id)) else "publish_failed"
                     return
             logger.info("%s nothing new to publish", tag)
-        except Exception:
+            outcome = "idle"
+        except Exception as e:
             logger.exception("%s run failed", tag)
+            self.x("UPDATE accounts SET last_error=?, last_error_at=? WHERE id=?", (str(e)[:500], now(), account_id))
         finally:
-            logger.info("%s run completed", tag)
+            self.x("UPDATE accounts SET last_run_at=?, last_outcome=? WHERE id=?", (now(), outcome, account_id))
+            M.RUNS.labels(acc["name"], outcome).inc()
+            logger.info("%s run completed outcome=%s", tag, outcome)
+            lock.release()
+
+    def queue_size(self, account_id: int) -> int:
+        return self.q("SELECT COUNT(*) AS n FROM clips WHERE account_id=? AND published=0 AND deleted_at IS NULL "
+                      "AND attempts < ?", (account_id, MAX_PUBLISH_ATTEMPTS), one=True)["n"]
 
     def find_new_video(self, query: str) -> Optional[dict]:
         limit = self.cfg.getint("search", "limit", fallback=5)
@@ -321,6 +360,7 @@ class ReelsManager:
         source = ROOT / "temp" / f"{video_id}.mp4"
         out_dir = ROOT / "reels" / str(acc["id"]) / f"{video_id}_{int(time.time())}"
         clip_ids = []
+        started = time.time()
         try:
             with self.render_lock:
                 logger.info("%s downloading %s", tag, video_id)
@@ -336,12 +376,18 @@ class ReelsManager:
                     "VALUES (?,?,?,?,?,?,0)",
                     (video_id, acc["id"], os.path.relpath(reel, ROOT), probe(reel)["duration"], title, now()),
                 ).lastrowid)
-            logger.info("%s queued %d reel(s) from %s", tag, len(clip_ids), video_id)
+            M.RENDERED.labels(acc["name"]).inc(len(clip_ids))
+            M.VIDEOS.labels(acc["name"], "ok").inc()
+            M.PIPELINE_SECONDS.labels(acc["name"]).observe(time.time() - started)
+            logger.info("%s queued %d reel(s) from %s in %.0fs", tag, len(clip_ids), video_id, time.time() - started)
         except Exception:
+            M.VIDEOS.labels(acc["name"], "failed").inc()
             logger.exception("%s failed processing %s", tag, video_id)
             shutil.rmtree(out_dir, ignore_errors=True)
         finally:
-            source.unlink(missing_ok=True)
+            # yt-dlp leaves <id>.fNNN.mp4(.part) fragments behind when a download dies
+            for leftover in source.parent.glob(f"{video_id}.*"):
+                leftover.unlink(missing_ok=True)
             self.x("UPDATE videos SET title=?, clips_created=?, last_updated=? WHERE video_id=?",
                    (title, len(clip_ids), now(), video_id))
         return clip_ids
@@ -357,11 +403,23 @@ class ReelsManager:
             thumb_ms = int((clip.get("duration") or 2) * 1000 / 3)
             media_id = self.ig(acc).publish_reel(str(path), caption, thumb_offset_ms=thumb_ms)
         except Exception as e:
+            msg = str(e)[:500]
+            if is_auth_error(e):
+                # the token is dead, not the reel: park the account instead of burning the clip's attempts
+                logger.error("%s publish failed: Instagram access token invalid (%s)", tag, msg)
+                self.x("UPDATE accounts SET auth_failed=1, last_error=?, last_error_at=? WHERE id=?",
+                       (msg, now(), acc["id"]))
+                M.PUBLISH_FAILURES.labels(acc["name"], "auth").inc()
+                return False
             logger.exception("%s publish failed for clip %s", tag, clip["id"])
-            self.x("UPDATE clips SET attempts=attempts+1, error=? WHERE id=?", (str(e)[:500], clip["id"]))
+            self.x("UPDATE clips SET attempts=attempts+1, error=? WHERE id=?", (msg, clip["id"]))
+            self.x("UPDATE accounts SET last_error=?, last_error_at=? WHERE id=?", (msg, now(), acc["id"]))
+            M.PUBLISH_FAILURES.labels(acc["name"], "error").inc()
             return False
         self.x("UPDATE clips SET published=1, published_at=?, ig_media_id=?, error=NULL WHERE id=?",
                (now(), media_id, clip["id"]))
+        self.x("UPDATE accounts SET auth_failed=0, last_error=NULL WHERE id=?", (acc["id"],))
+        M.PUBLISHED.labels(acc["name"]).inc()
         self.x("UPDATE videos SET instagram_media_id=? WHERE video_id=?", (media_id, clip["video_id"]))
         logger.info("%s published clip %s -> media %s", tag, clip["id"], media_id)
         delete_file(clip["reel_path"])

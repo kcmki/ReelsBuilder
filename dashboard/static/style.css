@@ -167,6 +167,7 @@ input[type="text"],
 input[type="password"],
 input[type="email"],
 input[type="number"],
+input[type="url"],
 textarea,
 select {
   width: 100%; padding: 9px 12px;
@@ -211,16 +212,104 @@ textarea { resize: vertical; min-height: 80px; font-family: var(--mono); font-si
 .htmx-request .htmx-indicator { display: inline; }
 .htmx-request.htmx-indicator  { display: inline; }
 
+/* ── Nav groups ──────────────────────────── */
+.nav-section {
+  padding: 16px 20px 6px; font-size: 10px; font-weight: 600; letter-spacing: 0.12em;
+  text-transform: uppercase; color: #64748B;
+}
+.nav-item .ext { margin-left: auto; opacity: .6; }
+.nav-dot { margin-left: auto; width: 8px; height: 8px; border-radius: 50%; background: var(--destructive); box-shadow: 0 0 6px var(--destructive); }
+.skip-link { position: absolute; left: -999px; top: 8px; z-index: 100; background: var(--accent); color: #000; padding: 8px 12px; border-radius: var(--radius); }
+.skip-link:focus { left: 8px; }
+
+/* ── Buttons: touch size + in-flight state ─ */
+.btn { min-height: 36px; justify-content: center; }
+.btn-sm { min-height: 32px; }
+.btn.htmx-request { opacity: .65; cursor: progress; pointer-events: none; }
+.btn.htmx-request::after {
+  content: ""; width: 12px; height: 12px; border-radius: 50%;
+  border: 2px solid currentColor; border-right-color: transparent; animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Small utilities (replace inline styles) ─ */
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.row-between { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; }
+.muted { color: var(--fg-muted); }
+.mono { font-family: var(--mono); }
+.empty { text-align: center; color: var(--fg-muted); padding: 32px 16px; }
+.empty .btn { margin-top: 12px; }
+.grid-auto { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap: 16px; }
+
+/* ── Callouts (problem + the fix) ──────────── */
+.callout {
+  display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; flex-wrap: wrap;
+  padding: 12px 16px; border-radius: var(--radius); margin-bottom: 12px; font-size: 13px;
+  border: 1px solid var(--warn); background: rgba(245,158,11,0.08); color: var(--fg);
+}
+.callout.danger { border-color: var(--destructive); background: rgba(239,68,68,0.08); }
+.callout strong { display: block; margin-bottom: 2px; }
+.alert-warn { background: rgba(245,158,11,0.1); border: 1px solid var(--warn); color: var(--warn); }
+
+/* ── Account health cards ────────────────── */
+.acc-card { display: flex; flex-direction: column; gap: 12px; }
+.acc-card .acc-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.acc-card .acc-name { font-weight: 600; font-size: 15px; color: var(--fg); }
+.acc-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.acc-stats div { background: var(--secondary); border-radius: var(--radius); padding: 8px 10px; }
+.acc-stats b { display: block; font-family: var(--mono); font-size: 18px; color: var(--fg); font-variant-numeric: tabular-nums; }
+.acc-stats span { font-size: 11px; color: var(--fg-muted); }
+.acc-meta { font-size: 12px; color: var(--fg-muted); display: grid; gap: 2px; }
+.health { display: inline-flex; align-items: center; gap: 6px; }
+.health::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.acc-card.is-bad { border-color: rgba(239,68,68,0.6); }
+
+/* ── Presets + disclosure ────────────────── */
+.preset {
+  text-align: left; background: var(--secondary); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px 12px; color: var(--fg); cursor: pointer; font-family: var(--sans); font-size: 13px;
+  transition: border-color var(--ease), background var(--ease); min-height: 44px;
+}
+.preset:hover { border-color: var(--accent); }
+.preset:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.preset small { display: block; color: var(--fg-muted); font-size: 11px; margin-top: 2px; }
+.presets { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; margin-bottom: 16px; }
+details.advanced { border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px; }
+details.advanced > summary { cursor: pointer; color: var(--fg-muted); font-size: 13px; margin-bottom: 12px; list-style-position: inside; }
+details.advanced > summary:hover { color: var(--fg); }
+.field-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0 16px; }
+.field-flash { animation: flash .6s ease-out; }
+@keyframes flash { from { box-shadow: 0 0 0 3px rgba(34,197,94,.5); } to { box-shadow: none; } }
+input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
+
 /* ── Responsive ──────────────────────────── */
 @media (max-width: 768px) {
-  .sidebar { width: 180px; }
   .main { padding: 16px; }
   .card-grid { grid-template-columns: 1fr 1fr; }
-}
-@media (max-width: 480px) {
-  .sidebar { display: none; }
+  /* sidebar becomes a horizontally scrolling top bar so navigation never disappears */
+  .layout { flex-direction: column; }
+  .sidebar {
+    width: 100%; height: auto; position: sticky; top: 0; z-index: 20;
+    flex-direction: row; align-items: center; padding: 0; overflow-x: auto; overflow-y: hidden;
+    border-right: none; border-bottom: 1px solid var(--border); scrollbar-width: none;
+  }
+  .sidebar-brand { border-bottom: none; margin: 0; padding: 0 12px; white-space: nowrap; }
+  .nav-section { display: none; }
+  .nav-item { padding: 0 12px; min-height: 48px; border-left: none; border-bottom: 3px solid transparent; white-space: nowrap; }
+  .nav-item.active { border-bottom-color: var(--accent); }
+  .sidebar-footer { margin: 0; padding: 0 12px; border-top: none; }
+  .btn { min-height: 44px; }
+  input[type="text"], input[type="password"], input[type="number"], input[type="url"], select, textarea { font-size: 16px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+
+.sr-only { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
+input[type="file"] { color: var(--fg-muted); font-family: var(--sans); font-size: 13px; }
+input[type="file"]::file-selector-button {
+  background: var(--secondary); color: var(--fg); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 7px 12px; margin-right: 10px; cursor: pointer; font-family: var(--sans);
+}
+input[type="file"]::file-selector-button:hover { border-color: var(--accent); }

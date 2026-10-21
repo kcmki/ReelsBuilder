@@ -1,8 +1,12 @@
 """Internal API for the dashboard (only reachable on the Docker network, never routed by Traefik)."""
+import shutil
 import threading
 import time
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, Response
+from prometheus_client import REGISTRY, CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client.core import GaugeMetricFamily
 
 from src.ClipBuilder import EDIT_FIELDS
 
@@ -25,17 +29,71 @@ def _bg(fn, *args):
     threading.Thread(target=fn, args=args, daemon=True).start()
 
 
+def health(acc: dict) -> tuple:
+    """(status, human message) — what the dashboard shows and what you should do about it."""
+    if not acc["enabled"]:
+        return "paused", "Paused: scheduled runs are off"
+    if acc.get("auth_failed"):
+        return "token_invalid", "Instagram access token is invalid or expired. Paste a new long-lived token."
+    if not acc["queries_list"]:
+        return "no_queries", "No YouTube search queries: add at least one so new reels can be made"
+    if acc.get("last_error"):
+        return "error", f"Last run hit an error: {acc['last_error'][:200]}"
+    return "ok", "Healthy"
+
+
+def _epoch(iso: str) -> float:
+    return datetime.fromisoformat(iso).replace(tzinfo=timezone.utc).timestamp()
+
+
+class _StateCollector:
+    """Per-account gauges computed from the DB at scrape time (no state to keep in sync)."""
+
+    def collect(self):
+        m = _manager
+        if m is None:
+            return
+        g = {name: GaugeMetricFamily(name, doc, labels=["account"]) for name, doc in [
+            ("reels_queue_size", "Reels waiting to be published"),
+            ("reels_account_enabled", "1 if the account's schedule is on"),
+            ("reels_account_token_valid", "0 when Instagram rejected the access token"),
+            ("reels_account_healthy", "1 when the dashboard shows the account as healthy"),
+            ("reels_last_publish_timestamp_seconds", "Unix time of the account's last successful publish"),
+        ]}
+        for acc in m.list_accounts():
+            last = m.q("SELECT MAX(published_at) AS t FROM clips WHERE account_id=? AND published=1",
+                       (acc["id"],), one=True)["t"]
+            g["reels_queue_size"].add_metric([acc["name"]], m.queue_size(acc["id"]))
+            g["reels_account_enabled"].add_metric([acc["name"]], 1 if acc["enabled"] else 0)
+            g["reels_account_token_valid"].add_metric([acc["name"]], 0 if acc.get("auth_failed") else 1)
+            g["reels_account_healthy"].add_metric([acc["name"]], 1 if health(acc)[0] in ("ok", "paused") else 0)
+            if last:
+                g["reels_last_publish_timestamp_seconds"].add_metric([acc["name"]], _epoch(last))
+        yield from g.values()
+        temp = m.abspath("temp")
+        tb = GaugeMetricFamily("reels_temp_bytes", "Bytes in the download temp dir (leftovers = leak)")
+        tb.add_metric([], sum(f.stat().st_size for f in temp.glob("*") if f.is_file()) if temp.exists() else 0)
+        yield tb
+        df = GaugeMetricFamily("reels_media_disk_free_bytes", "Free space on the reels media volume")
+        df.add_metric([], shutil.disk_usage(m.abspath("reels") if m.abspath("reels").exists() else m.abspath(".")).free)
+        yield df
+
+
+REGISTRY.register(_StateCollector())
+
+
 def _public(acc: dict) -> dict:
     """Account without its token (the dashboard only ever needs a hint)."""
     out = {k: v for k, v in acc.items() if k != "access_token"}
     out["token_hint"] = "…" + acc["access_token"][-4:]
+    out["health"], out["health_msg"] = health(acc)
     out["has_logo"] = _manager.logo_path(acc["id"]) is not None
     stats = _manager.q(
         "SELECT SUM(published=1) AS published, SUM(published=0 AND deleted_at IS NULL) AS queued, "
         "MAX(published_at) AS last_published FROM clips WHERE account_id=?", (acc["id"],), one=True)
     out.update({k: v or 0 for k, v in stats.items()})
     job = _manager.scheduler.get_job(f"account_{acc['id']}") if _manager.scheduler else None
-    out["next_run_time"] = job.next_run_time.isoformat() if job and job.next_run_time else None
+    out["next_run_time"] = job.next_run_time.astimezone(timezone.utc).isoformat() if job and job.next_run_time else None
     return out
 
 
@@ -48,7 +106,7 @@ def _account(account_id: int) -> dict:
 
 def _jobs():
     return [{"id": j.id, "name": j.name, "trigger": str(j.trigger),
-             "next_run_time": j.next_run_time.isoformat() if j.next_run_time else None}
+             "next_run_time": j.next_run_time.astimezone(timezone.utc).isoformat() if j.next_run_time else None}
             for j in _m().scheduler.get_jobs()]
 
 
@@ -64,8 +122,12 @@ def create_app() -> FastAPI:
     app = FastAPI(title="ReelsBuilder Internal API", docs_url=None, redoc_url=None)
 
     @app.get("/health")
-    def health():
+    def health_check():
         return {"status": "ok"}
+
+    @app.get("/metrics")
+    def metrics():
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     # --- jobs ------------------------------------------------------------------------
     @app.get("/status")
@@ -186,10 +248,17 @@ def create_app() -> FastAPI:
 
     @app.post("/accounts/{account_id}/test")
     def test_account(account_id: int):
+        """Doubles as the "I fixed my token" check: success clears the token flag, a 401 sets it."""
+        m = _m()
+        acc = _account(account_id)
         try:
-            return _m().ig(_account(account_id)).get_instagram_account()
+            info = m.ig(acc).get_instagram_account()
         except Exception as e:
+            if m.is_auth_error(e):
+                m.x("UPDATE accounts SET auth_failed=1, last_error=? WHERE id=?", (str(e)[:500], account_id))
             raise HTTPException(400, str(e))
+        m.x("UPDATE accounts SET auth_failed=0, last_error=NULL WHERE id=?", (account_id,))
+        return info
 
     @app.post("/accounts/{account_id}/process")
     def process_url(account_id: int, body: dict):

@@ -26,7 +26,9 @@ class YoutubeExtractorHandler:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         ydl_opts = {
-            "format": f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]",
+            # H.264 + AAC first: decodes several times faster than AV1/VP9 and muxes cleanly into mp4
+            "format": (f"bv*[height<={max_height}][vcodec^=avc1]+ba[ext=m4a]/"
+                       f"bv*[height<={max_height}]+ba/b[height<={max_height}]/b"),
             "outtmpl": str(output_path),
             "merge_output_format": "mp4",
             "quiet": True,

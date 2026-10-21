@@ -1,4 +1,6 @@
-yt-dlp
+yt-dlp[default]
+# JS runtime yt-dlp needs for YouTube (without it formats go missing and downloads crawl)
+deno
 scrapetube
 requests
 curl_cffi
@@ -6,3 +8,4 @@ apscheduler<4
 fastapi
 uvicorn[standard]
 httpx
+prometheus_client

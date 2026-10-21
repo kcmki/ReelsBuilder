@@ -1,0 +1,23 @@
+{% macro health_badge(a) -%}
+{%- set cls = {'ok': 'badge-green', 'paused': 'badge-gray', 'no_queries': 'badge-warn', 'error': 'badge-warn', 'token_invalid': 'badge-red'}.get(a.health, 'badge-gray') -%}
+{%- set label = {'ok': 'Healthy', 'paused': 'Paused', 'no_queries': 'No queries', 'error': 'Error', 'token_invalid': 'Token invalid'}.get(a.health, a.health) -%}
+<span class="badge {{ cls }} health" title="{{ a.health_msg }}">{{ label }}</span>
+{%- endmacro %}
+
+{% macro when(ts) -%}
+{{ ts[:16].replace('T', ' ') ~ ' UTC' if ts else '—' }}
+{%- endmacro %}
+
+{% macro attention(accounts) -%}
+{% for a in accounts if a.health in ('token_invalid', 'error', 'no_queries') %}
+<div class="callout {% if a.health == 'token_invalid' %}danger{% endif %}" role="alert">
+  <div>
+    <strong>{{ a.name }}: {{ {'token_invalid': 'not publishing, Instagram rejected the token', 'error': 'last run failed', 'no_queries': 'cannot find new videos'}[a.health] }}</strong>
+    <span class="muted">{{ a.health_msg }}</span>
+  </div>
+  <a class="btn btn-sm {% if a.health == 'token_invalid' %}btn-danger{% else %}btn-ghost{% endif %}" href="/accounts/{{ a.id }}{% if a.health == 'token_invalid' %}#access_token{% elif a.health == 'no_queries' %}#queries{% endif %}">
+    {{ {'token_invalid': 'Update token', 'error': 'Open account', 'no_queries': 'Add queries'}[a.health] }}
+  </a>
+</div>
+{% endfor %}
+{%- endmacro %}

@@ -4,11 +4,11 @@
 
 <div class="page-header">
   <div class="page-title">Reels</div>
-  <div class="page-subtitle">Preview rendered reels, publish one now, or drop the ones you don't like</div>
+  <div class="page-subtitle">Watch what's about to post. Publish one now or drop the ones you don't like. Oldest queued posts first.</div>
 </div>
 
-<form method="get" action="/reels" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;align-items:center">
-  <select name="account_id" onchange="this.form.submit()" style="width:auto">
+<form method="get" action="/reels" class="row" style="margin-bottom:16px">
+  <select name="account_id" onchange="this.form.submit()" style="width:auto" aria-label="Account">
     <option value="0">All accounts</option>
     {% for acc in accounts %}<option value="{{ acc.id }}" {% if acc.id == account_id %}selected{% endif %}>{{ acc.name }}</option>{% endfor %}
   </select>
@@ -48,7 +48,13 @@
   {% endfor %}
 </div>
 {% if not clips['items'] %}
-<div class="card" style="text-align:center;color:var(--fg-muted);padding:24px">Nothing here.</div>
+<div class="card empty">
+  {% if status == 'queued' %}
+  <div>Queue is empty. The next scheduled run will find a video and render new reels.</div>
+  <div class="form-hint">Want to choose the video yourself? Open an account and use <em>Render from a YouTube URL</em>.</div>
+  <a href="{{ '/accounts/' ~ account_id if account_id else '/accounts' }}" class="btn btn-ghost btn-sm">Go to account</a>
+  {% else %}<div>No reels match this filter.</div>{% endif %}
+</div>
 {% endif %}
 
 <div class="pagination">

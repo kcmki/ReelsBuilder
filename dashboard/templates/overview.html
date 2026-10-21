@@ -4,12 +4,12 @@
 
 <div class="page-header">
   <div class="page-title">Overview</div>
-  <div class="page-subtitle">Scheduler and automation status</div>
+  <div class="page-subtitle">What is publishing, what is stuck, and what needs you</div>
 </div>
 
 <div id="overview-content"
   hx-get="/overview/refresh"
-  hx-trigger="every 10s"
+  hx-trigger="every 15s"
   hx-swap="outerHTML">
   {% include "overview_partial.html" %}
 </div>

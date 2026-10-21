@@ -1,5 +1,6 @@
 """ffmpeg-only reel editor: picks highlight windows and renders 9:16 reels."""
 import json
+import logging
 import shutil
 import subprocess
 import tempfile
@@ -7,6 +8,7 @@ import textwrap
 from pathlib import Path
 from typing import List, Optional
 
+log = logging.getLogger("reels_manager")
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 # Single source of truth for per-account editing options (the dashboard renders its form from this).
@@ -71,6 +73,12 @@ def probe(path: str) -> dict:
         "duration": float(data["format"]["duration"]),
         "has_audio": any(s.get("codec_type") == "audio" for s in data.get("streams", [])),
     }
+
+
+def _has_video(path: str) -> bool:
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries", "stream=index",
+                        "-of", "csv=p=0", str(path)], capture_output=True, text=True)
+    return bool(r.stdout.strip())
 
 
 def pick_windows(heatmap: Optional[list], duration: float, count: int, length: float) -> List[tuple]:
@@ -213,8 +221,19 @@ class ClipBuilder:
             segs = []
             for i, (start, length) in enumerate(windows):
                 seg = f"{tmp}/seg_{i}.mp4"
-                self.render_segment(source, start, length, seg, info["has_audio"])
+                try:
+                    self.render_segment(source, start, length, seg, info["has_audio"])
+                    if probe(seg)["duration"] < 1:
+                        raise RuntimeError("segment came out empty")
+                    if not _has_video(seg):
+                        raise RuntimeError("segment has no video frames")
+                except Exception as err:
+                    # one bad window (corrupt stretch of the source) shouldn't sink the whole video
+                    log.warning("skipping window %s@%.1fs: %s", i, start, str(err)[-300:])
+                    continue
                 segs.append(seg)
+            if not segs:
+                raise RuntimeError(f"no usable segments out of {len(windows)} windows")
             groups = [segs] if e["mode"] == "montage" else [[s] for s in segs]
             for i, group in enumerate(groups):
                 joined = f"{tmp}/joined_{i}.mp4"
@@ -249,6 +268,13 @@ if __name__ == "__main__":
             p = probe(outs[0])
             assert p["has_audio"], p
             print(mode, [round(probe(o)["duration"], 1) for o in outs])
+        # video stream ends at 10s but audio runs to 30s (the production failure): bad windows are skipped
+        broken = f"{d}/broken.mp4"
+        _run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc2=s=1280x720:d=10", "-f", "lavfi", "-i", "sine=d=30",
+              *ENC, broken])
+        outs = ClipBuilder({"clips_count": 3, "clip_length": 4}).build(broken, None, f"{d}/broken")
+        assert len(outs) == 1, outs
+        print("broken source ->", len(outs), "reel")
         if "--keep" in sys.argv:
             shutil.copytree(d, sys.argv[-1], dirs_exist_ok=True)
     print("ClipBuilder self-check OK")

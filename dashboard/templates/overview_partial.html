@@ -1,90 +1,77 @@
+{% from "_macros.html" import health_badge, when, attention %}
 <div id="overview-content"
   hx-get="/overview/refresh"
-  hx-trigger="every 10s"
+  hx-trigger="every 15s"
   hx-swap="outerHTML">
+
+  {% if not status %}
+  <div class="callout danger" role="alert">
+    <div><strong>Can't reach the reelsbuilder service</strong><span class="muted">The dashboard is up but the worker container isn't answering. Check it in Grafana or with <code>docker logs reelsbuilder</code>.</span></div>
+    <a class="btn btn-ghost btn-sm" href="https://grafana.mekki.tech/dashboards?query=Reels" target="_blank" rel="noopener noreferrer">Open Grafana ↗</a>
+  </div>
+  {% else %}
+
+  {{ attention(status.get('accounts', [])) }}
 
   <div class="card-grid">
     <div class="card">
-      <div class="stat-label">Scheduler</div>
-      <div style="margin-top:8px">
-        {% if status.get('scheduler_running') %}
-          <span class="badge badge-green">Running</span>
-        {% else %}
-          <span class="badge badge-red">Stopped</span>
-        {% endif %}
-      </div>
-    </div>
-    <div class="card">
-      <div class="stat-label">Interactions</div>
-      <div style="margin-top:8px">
-        {% if status.get('interactions_enabled') %}
-          <span class="badge badge-green">Enabled</span>
-        {% else %}
-          <span class="badge badge-gray">Disabled</span>
-        {% endif %}
-      </div>
-    </div>
-    <div class="card">
-      <div class="stat-label">Videos Processed</div>
-      <div class="stat-value">{{ total_videos }}</div>
-    </div>
-    <div class="card">
-      <div class="stat-label">Clips Published</div>
+      <div class="stat-label">Published (all time)</div>
       <div class="stat-value">{{ total_clips }}</div>
     </div>
     <div class="card">
-      <div class="stat-label">Interactions Logged</div>
-      <div class="stat-value">{{ total_interactions }}</div>
+      <div class="stat-label">Waiting in queue</div>
+      <div class="stat-value">{{ status.get('accounts', []) | sum(attribute='queued') }}</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Videos used</div>
+      <div class="stat-value">{{ total_videos }}</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Scheduler</div>
+      <div style="margin-top:8px">
+        {% if status.get('scheduler_running') %}<span class="badge badge-green health">Running</span>{% else %}<span class="badge badge-red health">Stopped</span>{% endif %}
+        <span class="badge {% if status.get('interactions_enabled') %}badge-green{% else %}badge-gray{% endif %}" title="Auto-replies to comments and DMs">Replies {{ 'on' if status.get('interactions_enabled') else 'off' }}</span>
+      </div>
     </div>
   </div>
+
+  <div class="row-between" style="margin:8px 0 12px">
+    <div class="form-section-title" style="border:0;margin:0;padding:0">Accounts</div>
+    <a href="/accounts/new" class="btn btn-ghost btn-sm">+ Add account</a>
+  </div>
+  <div id="ov-feedback" aria-live="polite"></div>
 
   {% if status.get('accounts') %}
-  <div class="card" style="margin-top:16px">
-    <div class="form-section-title">Accounts</div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Account</th><th>Status</th><th>Published</th><th>Queued</th><th>Last published</th><th>Next run</th></tr></thead>
-        <tbody>
-          {% for a in status['accounts'] %}
-          <tr>
-            <td><a href="/accounts/{{ a.id }}">{{ a.name }}</a></td>
-            <td>{% if a.enabled %}<span class="badge badge-green">Enabled</span>{% else %}<span class="badge badge-gray">Paused</span>{% endif %}</td>
-            <td>{{ a.published }}</td>
-            <td><a href="/reels?account_id={{ a.id }}">{{ a.queued }}</a></td>
-            <td>{{ a.last_published[:16].replace('T', ' ') if a.last_published else '—' }}</td>
-            <td>{{ a.next_run_time[:16].replace('T', ' ') if a.next_run_time else '—' }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+  <div class="grid-auto">
+    {% for a in status['accounts'] %}
+    <div class="card acc-card {% if a.health == 'token_invalid' %}is-bad{% endif %}">
+      <div class="acc-head">
+        <a class="acc-name" href="/accounts/{{ a.id }}">{{ a.name }}</a>
+        {{ health_badge(a) }}
+      </div>
+      <div class="acc-stats">
+        <div><b>{{ a.published }}</b><span>published</span></div>
+        <div><b>{{ a.queued }}</b><span>queued</span></div>
+        <div><b>{{ a.edit.mode }}</b><span>{{ a.edit.layout }} style</span></div>
+      </div>
+      <div class="acc-meta">
+        <span>Last published: {{ when(a.last_published or None) }}</span>
+        <span>Next run: {{ when(a.next_run_time) }} <span class="mono">({{ a.cron }})</span></span>
+        {% if a.last_outcome %}<span>Last run: {{ a.last_outcome.replace('_', ' ') }} · {{ when(a.last_run_at) }}</span>{% endif %}
+      </div>
+      <div class="row">
+        <button class="btn btn-primary btn-sm" hx-post="/accounts/{{ a.id }}/run" hx-target="#ov-feedback" {% if a.health == 'token_invalid' %}disabled title="Fix the token first"{% endif %}>Run now</button>
+        <a class="btn btn-ghost btn-sm" href="/reels?account_id={{ a.id }}">Queue</a>
+        <a class="btn btn-ghost btn-sm" href="/accounts/{{ a.id }}">Settings</a>
+      </div>
     </div>
-  </div>
-  {% elif status %}
-  <div class="card" style="margin-top:16px">No accounts yet — <a href="/accounts/new">add your first Instagram account</a>.</div>
-  {% endif %}
-
-  {% if status.get('jobs') %}
-  <div class="card" style="margin-top:16px">
-    <div class="form-section-title">Upcoming Runs</div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Job</th><th>Next Run</th><th>Trigger</th></tr></thead>
-        <tbody>
-          {% for job in status['jobs'] %}
-          <tr>
-            <td>{{ job.id }}</td>
-            <td>{{ job.next_run_time or '—' }}</td>
-            <td style="color:var(--fg-muted)">{{ job.trigger or '—' }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
+    {% endfor %}
   </div>
   {% else %}
-  <div class="card" style="color:var(--fg-muted);font-size:13px;margin-top:16px">
-    No job data — is the reelsbuilder container running?
+  <div class="card empty">
+    <div>No Instagram accounts yet.</div>
+    <a href="/accounts/new" class="btn btn-primary">Add your first account</a>
   </div>
   {% endif %}
-
+  {% endif %}
 </div>
