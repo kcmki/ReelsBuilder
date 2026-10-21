@@ -1,76 +1,46 @@
 # ReelsBuilder
 
-> ReelsBuilder is a lightweight Python project for building short video reels from clips, with handlers for cloud and social platforms and optional Docker support.
+Finds YouTube videos, cuts their most-replayed moments into vertical reels, and publishes them to one or more Instagram accounts on a schedule. Everything is managed from the web dashboard at https://reels.mekki.tech.
 
-## Overview
+## How it works
 
-ReelsBuilder automates assembly of short videos from input clips, applies logos and basic processing, and produces ready-to-upload reels. It includes handlers for Google Drive, YouTube extraction, Instagram, Supabase/S3 storage, and a simple local filesystem workflow.
+Each **account** (Accounts page) has its own Instagram token, cron schedule, YouTube search queries, caption and edit style. On every scheduled run an account:
 
-## Key Components
+1. publishes the oldest reel in its queue, or, if the queue is empty,
+2. searches its queries for a video no account has used yet, downloads it, renders reels with its edit style, queues them, and publishes the first one.
 
-- `run_manager.py`: entrypoint for running the manager process that coordinates clip processing.
-- `src/ClipBuilder.py`: primary clip assembly logic.
-- `src/videoMaker.py`: video composition utilities and export routines.
-- `src/DriveHandler.py`, `src/YoutubeExtractorHandler.py`, `src/InstagramHandler.py`, `src/SupabaseS3Handler.py`: platform-specific handlers.
-- `src/lib.py`: shared helpers and utilities.
-- `settings.ini`: runtime configuration (paths, credentials, flags).
-- `clips/` and `reels/`: input clip storage and output reels.
+One reel per run, so the cron sets the posting rate (`0 9,13,19 * * *` = 3 per day).
 
-## Installation
+### Edit styles (rendered by ffmpeg)
 
-1. Create a Python 3.10+ virtual environment:
+- **single**: every highlight becomes its own reel; **montage**: highlights are joined with transitions (`fade`, `slideleft`, `zoomin`, …) into one reel
+- **blur** (video over a blurred fill), **crop** (fill the frame) or **fit** (black bars), output 1080×1920 @ 30fps
+- zoom, speed, saturation/contrast, edge trim (hides watermarks), fades, title text overlay (`{title}`), per-account logo
 
-```bash
-python -m venv .venv
-source .venv/bin/activate  # on Windows: .venv\\Scripts\\activate
-```
+Highlights come from YouTube's "most replayed" heatmap (via yt-dlp), and evenly spaced picks fill in when a video has no or few peaks.
 
-2. Install dependencies (project uses a `requirements` file):
+### Dashboard
 
-```bash
-pip install -r requirements
-```
+- **Accounts**: add/edit/pause accounts, upload a logo, test the connection, run now, **render from a specific YouTube URL**
+- **Reels**: preview queued reels in the browser, publish one immediately, or drop it
+- **Jobs / Settings / Logs / Executions / Instagram**: scheduler control, global settings, live logs, history
 
-## Configuration
+## Layout
 
-Edit `settings.ini` to configure input/output paths, API keys, and optional flags (for example, disabling interactive prompts). Credentials for external services are stored under `src/credentials.json` or referenced from individual handlers.
+- `run_manager.py`: scheduler, accounts, pipeline, DB (SQLite)
+- `src/ClipBuilder.py`: ffmpeg editor plus the `EDIT_FIELDS` list that drives the dashboard form
+- `src/InstagramHandler.py`: Graph API (resumable reel upload)
+- `src/YoutubeExtractorHandler.py`: search (scrapetube) and download (yt-dlp)
+- `src/api.py`: internal API on :8080 used by the dashboard (Docker network only)
+- `dashboard/`: FastAPI + Jinja + htmx web UI on :8000
+- `settings.ini`: global defaults; the edited copy is persisted at `/app/data/settings.ini`
 
-## Usage
+## Deploy
 
-- Run the manager to process new clips:
+Pushing to `main` deploys via ZimaPaaS (`platform.yaml`, compose strategy). On first boot after the multi-account upgrade, the old `LONG_TIME_ACCESS_TOKEN` / `INSTAGRAM_BUISINESS_ACCOUNT` / `FB_PAGE_ID` env vars are turned into an account named `default`. After that, accounts are managed in the dashboard and the env vars are no longer read.
 
-```bash
-python run_manager.py
-```
-
-- Common options: pass `--disable-interaction` to run non-interactively.
-
-Processed reels are written to the `reels/` directory, one subfolder per source clip set.
-
-## Docker
-
-The repository includes a `Dockerfile` and `docker-compose.yml` for containerized runs. Build and start with:
+## Checks
 
 ```bash
-docker-compose up --build
+python src/ClipBuilder.py   # window picking + real single/montage renders (needs ffmpeg)
 ```
-
-Adjust mounted volumes and `settings.ini` as needed for persistence and credential injection.
-
-## Development Notes
-
-- Source files live under `src/`. Keep handlers focused and small—they should only manage I/O and authentication, delegating processing to `ClipBuilder` and `videoMaker`.
-- Temporary files are placed in `temp/` and can be cleaned regularly.
-
-## Contributing
-
-1. Fork the repo, create a feature branch, and open a PR.
-2. Include small, focused changes and update `README.md` if behavior or config changes.
-
-## License
-
-Repository does not include an explicit license file. Add a `LICENSE` if you intend to publish or share.
-
----
-
-If you'd like, I can also (a) expand sections with examples, (b) generate a `requirements.txt` from the `requirements` file, or (c) add a small usage example notebook. Which would you prefer next?

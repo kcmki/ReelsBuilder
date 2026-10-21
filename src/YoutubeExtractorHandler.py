@@ -1,180 +1,47 @@
-from curl_cffi import  requests
 import re
-import json
-from typing import List, Callable, Optional
+from typing import List, Optional
+from pathlib import Path
+
 import scrapetube
 from yt_dlp import YoutubeDL
-from pathlib import Path
+
 
 class YoutubeExtractorHandler:
 
-    # --- Fetch videos from search query ---
-    def search_videos_depreciated(
-        self, 
-        query: str, 
-        max_results: int = 10, 
-        filter_fn: Optional[Callable[[dict], bool]] = None
-    ) -> List[dict]:
-        """
-        Search YouTube for videos matching a query.
-        Optionally filter results with filter_fn(video_dict) -> bool
-        """
-        search_url = f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"
-        response = requests.get(search_url)
-        
-        # Extract JSON from ytInitialData
-        script_match = re.search(r'<script.*?>\s*var ytInitialData = ({.*?});\s*</script>', response.text, re.DOTALL)
-        if not script_match:
-            print("ytInitialData not found in search page")
-            return []
-
-        json_data = json.loads(script_match.group(1))
-        try:
-            videos = []
-            contents = json_data["contents"]["twoColumnSearchResultsRenderer"]["primaryContents"]["sectionListRenderer"]["contents"]
-            for section in contents:
-                items = section.get("itemSectionRenderer", {}).get("contents", [])
-                for item in items:
-                    if "videoRenderer" in item:
-                        video_info = item["videoRenderer"]
-                        if not filter_fn or filter_fn(video_info):
-                            videos.append(video_info)
-                        if len(videos) >= max_results:
-                            break
-            return videos
-        except KeyError:
-            print("Unexpected JSON structure")
-            return []
-
-    # ---------------------------------------------------
-    # SEARCH
-    # ---------------------------------------------------
-    def search_videos(
-        self,
-        query: str,
-        limit: int = 10,
-        sort_by: str = "relevance",
-        results_type: str = "video",
-        sleep: int = 1,
-        proxies: Optional[dict] = None,
-        filters: Optional[List[Callable[[dict], bool]]] = None,
-    ) -> List[dict]:
-        """
-        Search YouTube using scrapetube with optional filters
-        """
-        videos: Generator[dict, None, None] = scrapetube.get_search(
-            query=query,
-            limit=limit,
-            sleep=sleep,
-            sort_by=sort_by,
-            results_type=results_type,
-            proxies=proxies,
-        )
-
+    def search_videos(self, query: str, limit: int = 10, sort_by: str = "relevance", sleep: int = 1) -> List[dict]:
+        """Search YouTube; returns [{video_id, title}]."""
         results = []
-        for video in videos:
-            if filters:
-                if not all(f(video) for f in filters):
-                    continue
-            results.append(video)
-
+        for v in scrapetube.get_search(query=query, limit=limit, sleep=sleep, sort_by=sort_by, results_type="video"):
+            vid = v.get("videoId")
+            if vid:
+                runs = (v.get("title") or {}).get("runs") or [{}]
+                results.append({"video_id": vid, "title": runs[0].get("text", "")})
         return results
-    
-    # --- Extract points without concatenation ---
-    def get_points(self, url: str, top_x: int = 5) -> List[dict]:
-        response = requests.get(url)
-        script_match = re.search(r'<script.*?>\s*var ytInitialData = ({.*?});\s*</script>', response.text, re.DOTALL)
-        if not script_match:
-            print("ytInitialData not found")
-            return []
 
-        json_data = json.loads(script_match.group(1))
-        try:
-            scores = None
-            for i in json_data["frameworkUpdates"]["entityBatchUpdate"]["mutations"]:
-                try:
-                    if i.get("payload"):
-                        if i["payload"]["macroMarkersListEntity"]["markersList"]["markers"]:
-                            scores = i["payload"]["macroMarkersListEntity"]["markersList"]["markers"]
-                            break
-                except KeyError:
-                    continue        
-        except KeyError:
-            print("Markers not found in video data")
-            return []
-        if not scores:
-            print("No intensity markers found for this video")
-            return []
-        max_intensity_elements = sorted(scores, key=lambda x: x['intensityScoreNormalized'])
-        return max_intensity_elements[-top_x:]
+    def download_video(self, url: str, output_path: str, max_height: int = 1080) -> dict:
+        """Download to output_path. Returns {path, title, duration, heatmap}.
 
-    # --- Extract points with concatenation ---
-    def get_points_concatenated(self, url: str, top_x: int = 5) -> List[dict]:
-        response = requests.get(url)
-        script_match = re.search(r'<script.*?>\s*var ytInitialData = ({.*?});\s*</script>', response.text, re.DOTALL)
-        if not script_match:
-            print("ytInitialData not found")
-            return []
-
-        json_data = json.loads(script_match.group(1))
-        try:
-            scores = None
-            for i in json_data["frameworkUpdates"]["entityBatchUpdate"]["mutations"]:
-                try:
-                    if i.get("payload"):
-                        if i["payload"]["macroMarkersListEntity"]["markersList"]["markers"]:
-                            scores = i["payload"]["macroMarkersListEntity"]["markersList"]["markers"]
-                            break
-                except KeyError:
-                    continue        
-        except KeyError:
-            print("Markers not found in video data")
-            return []
-        if not scores:
-            print("No intensity markers found for this video")
-            return []
-
-        # Ensure duration is int
-        for score in scores:
-            score['durationMillis'] = int(score['durationMillis'])
-
-        # Merge consecutive points with high intensity
-        i = 0
-        while i < len(scores) - 1:
-            current = scores[i]
-            next_point = scores[i + 1]
-            if current['intensityScoreNormalized'] > 0.5 and next_point['intensityScoreNormalized'] > 0.5:
-                current['durationMillis'] += next_point['durationMillis']
-                current["intensityScoreNormalized"] = max(current["intensityScoreNormalized"], next_point["intensityScoreNormalized"])
-                scores.pop(i + 1)
-            else:
-                i += 1
-
-        max_intensity_elements = sorted(scores, key=lambda x: x['intensityScoreNormalized'])
-        return max_intensity_elements[-top_x:]
-
-    def download_video(
-        self,
-        url: str,
-        output_path: str,
-        max_height: int = 1080,
-    ) -> str:
-        """
-        Download a YouTube video to a given path.
-        Returns the final video path.
+        heatmap is yt-dlp's "most replayed" data ([{start_time, end_time, value}]) or None.
         """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-
         ydl_opts = {
             "format": f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]",
             "outtmpl": str(output_path),
             "merge_output_format": "mp4",
+            "quiet": True,
+            "noprogress": True,
+        }
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        return {
+            "path": str(output_path),
+            "title": info.get("title") or "",
+            "duration": info.get("duration"),
+            "heatmap": info.get("heatmap") or None,
         }
 
-        with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-
-        return str(output_path)
-
-
+    @staticmethod
+    def video_id(url: str) -> Optional[str]:
+        m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/)([\w-]{11})", url)
+        return m.group(1) if m else None

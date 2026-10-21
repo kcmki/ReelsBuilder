@@ -21,7 +21,7 @@ def _fetch_overview():
     except Exception:
         total_videos = "—"
     try:
-        total_clips = api.get_clips(per_page=1).get("total", "—")
+        total_clips = api.get_clips(per_page=1, status="published").get("total", "—")
     except Exception:
         total_clips = "—"
     try:

@@ -1,11 +1,9 @@
+import json
 import os
+import time
 import requests
-from dotenv import load_dotenv, set_key
 from typing import Dict, List, Optional
-import mimetypes
-import uuid
 
-ENV_PATH = ".env"
 GRAPH_BASE = "https://graph.facebook.com/v24.0"
 
 
@@ -21,56 +19,26 @@ class InstagramHandler:
     - Exporting conversation as JSON
     """
 
-    def __init__(self, env_path: str = ".env"):
-        self.env_path = env_path
-        load_dotenv(env_path)
+    def __init__(self, access_token: str, ig_business_id: str, page_id: Optional[str] = None):
+        if not access_token or not ig_business_id:
+            raise ValueError("access_token and ig_business_id are required")
+        self.access_token = access_token
+        self.ig_business_id = ig_business_id
+        self.page_id = page_id
 
-        self.app_id = os.getenv("APP_ID") or os.getenv("App_id")
-        self.app_secret = os.getenv("APP_SECRET") or os.getenv("App_secret")
-        self.user_token = os.getenv("USER_TOKEN")
-        self.page_id = os.getenv("FB_PAGE_ID")
-        self.ig_business_id = os.getenv("INSTAGRAM_BUISINESS_ACCOUNT")
-        self.access_token = os.getenv("LONG_TIME_ACCESS_TOKEN")
-
-        self._validate_env()
-        self._ensure_long_lived_token()
-
-    # ------------------------------------------------------------------
-    # 🔐 TOKEN MANAGEMENT
-    # ------------------------------------------------------------------
-
-    def _validate_env(self):
-        missing = [
-            name for name, value in {
-                "APP_ID": self.app_id,
-                "APP_SECRET": self.app_secret,
-                "USER_TOKEN": self.user_token,
-                "FB_PAGE_ID": self.page_id,
-                "INSTAGRAM_BUISINESS_ACCOUNT": self.ig_business_id,
-            }.items() if not value
-        ]
-        if missing:
-            raise EnvironmentError(f"Missing env vars: {missing}")
-
-    def _ensure_long_lived_token(self):
-        if self.access_token:
-            return
-
-        token = self._exchange_long_lived_token()
-        set_key(self.env_path, "LONG_TIME_ACCESS_TOKEN", token)
-        self.access_token = token
-
-    def _exchange_long_lived_token(self) -> str:
+    @staticmethod
+    def exchange_long_lived_token(app_id: str, app_secret: str, user_token: str) -> str:
         r = requests.get(
-            "https://graph.facebook.com/v17.0/oauth/access_token",
+            f"{GRAPH_BASE}/oauth/access_token",
             params={
                 "grant_type": "fb_exchange_token",
-                "client_id": self.app_id,
-                "client_secret": self.app_secret,
-                "fb_exchange_token": self.user_token,
+                "client_id": app_id,
+                "client_secret": app_secret,
+                "fb_exchange_token": user_token,
             },
+            timeout=30,
         )
-        r.raise_for_status()
+        _raise(r)
         return r.json()["access_token"]
 
     # ------------------------------------------------------------------
@@ -80,14 +48,16 @@ class InstagramHandler:
     def _get(self, endpoint: str, params: Optional[Dict] = None) -> Dict:
         params = params or {}
         params["access_token"] = self.access_token
-        r = requests.get(f"{GRAPH_BASE}/{endpoint}", params=params)
-        r.raise_for_status()
+        r = requests.get(f"{GRAPH_BASE}/{endpoint}", params=params, timeout=60)
+        _raise(r)
         return r.json()
 
     def _post(self, endpoint: str, data: Dict) -> Dict:
+        # nested dicts (e.g. messaging recipient) must be JSON-encoded for form posts
+        data = {k: json.dumps(v) if isinstance(v, dict) else v for k, v in data.items()}
         data["access_token"] = self.access_token
-        r = requests.post(f"{GRAPH_BASE}/{endpoint}", data=data)
-        r.raise_for_status()
+        r = requests.post(f"{GRAPH_BASE}/{endpoint}", data=data, timeout=60)
+        _raise(r)
         return r.json()
 
     # ------------------------------------------------------------------
@@ -173,8 +143,8 @@ class InstagramHandler:
 
         # Use requests directly so we can control JSON body and headers
         headers = {"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json"}
-        r = requests.post(f"{GRAPH_BASE}/{self.ig_business_id}/media", headers=headers, json=payload)
-        r.raise_for_status()
+        r = requests.post(f"{GRAPH_BASE}/{self.ig_business_id}/media", headers=headers, json=payload, timeout=60)
+        _raise(r)
         return r.json()
 
     def upload_resumable_video(self, upload_uri: str, *, local_path: Optional[str] = None, file_url: Optional[str] = None, offset: int = 0) -> Dict:
@@ -189,14 +159,14 @@ class InstagramHandler:
             file_size = os.path.getsize(local_path)
             headers.update({"offset": str(offset), "file_size": str(file_size)})
             with open(local_path, "rb") as fh:
-                r = requests.post(upload_uri, headers=headers, data=fh)
+                r = requests.post(upload_uri, headers=headers, data=fh, timeout=600)
         elif file_url:
             headers.update({"file_url": file_url})
             r = requests.post(upload_uri, headers=headers)
         else:
             raise ValueError("Either local_path or file_url must be provided")
 
-        r.raise_for_status()
+        _raise(r)
         # rupload often returns plain JSON-like text
         try:
             return r.json()
@@ -218,6 +188,23 @@ class InstagramHandler:
         if status != "FINISHED":
             raise RuntimeError(f"Media container not ready: {status}")
         return self._post(f"{self.ig_business_id}/media_publish", {"creation_id": creation_id})
+
+    def publish_reel(self, local_path: str, caption: str, thumb_offset_ms: int = 0) -> str:
+        """Full resumable flow: container -> upload -> wait -> publish. Returns the IG media id."""
+        resp = self.create_resumable_media_container(
+            media_type="REELS", caption=caption, thumb_offset=thumb_offset_ms)
+        container_id, upload_uri = resp.get("id"), resp.get("uri")
+        if not container_id or not upload_uri:
+            raise RuntimeError(f"Invalid resumable container response: {resp}")
+        self.upload_resumable_video(upload_uri, local_path=local_path)
+        for _ in range(60):
+            status = self.get_container_status(container_id)
+            if status == "FINISHED":
+                return self._post(f"{self.ig_business_id}/media_publish", {"creation_id": container_id})["id"]
+            if status in ("ERROR", "EXPIRED"):
+                raise RuntimeError(f"Container {container_id} {status}: {self.get_container_video_status(container_id)}")
+            time.sleep(5)
+        raise TimeoutError(f"Container {container_id} not ready after 5 min")
 
     # ------------------------------------------------------------------
     # 🗂 MEDIA CONTAINER CRUD
@@ -344,23 +331,12 @@ class InstagramHandler:
         return {"conversation_id": conversation_id, "platform": "instagram", "messages": messages}
 
 
-
-# ------------------------------------------------------------------
-# 🧪 EXAMPLE USAGE
-# ------------------------------------------------------------------
-
-if __name__ == "__main__":
-    ig = InstagramHandler()
-
-    print("User Details:", ig.get_user_details())
-    print("Instagram Account:", ig.get_instagram_account())
-    print("Recent Media:", ig.get_instagram_media(limit=5))
-
-    # Export first conversation as JSON
-    conversations = ig.list_conversations()
-    if conversations:
-        conv_json = ig.export_conversation_as_json(conversations[0]["id"], limit=10)
-        print("Conversation JSON:", conv_json)
-
-    # Example posting local media
-    # ig.post_local_media("./assets/post.jpg", caption="Hello from local file!")
+def _raise(r: requests.Response):
+    """raise_for_status, but keep Graph's error message (it says *why*, e.g. expired token)."""
+    if r.ok:
+        return
+    try:
+        msg = r.json().get("error", {}).get("message") or r.text
+    except ValueError:
+        msg = r.text
+    raise requests.HTTPError(f"{r.status_code} {msg}", response=r)

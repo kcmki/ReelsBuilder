@@ -19,15 +19,11 @@ def executions_page(
     page: int = 1,
 ):
     try:
-        videos = api.get_videos(page=page if tab == "videos" else 1)
+        videos = api.get_videos(page=page)
     except Exception:
         videos = {"items": [], "total": 0, "page": 1}
-    try:
-        clips = api.get_clips(page=page if tab == "clips" else 1, per_page=20)
-    except Exception:
-        clips = {"items": [], "total": 0, "page": 1}
 
     return templates.TemplateResponse(request, "executions.html", {
         "active": "executions", "user": user,
-        "tab": tab, "videos": videos, "clips": clips, "page": page,
+        "tab": tab, "videos": videos, "page": page,
     })

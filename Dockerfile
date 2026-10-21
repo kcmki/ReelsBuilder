@@ -8,8 +8,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
         build-essential \
-        libgl1 \
-        libglib2.0-0 \
+        fonts-dejavu-core \
         ca-certificates \
         dos2unix \
         procps \

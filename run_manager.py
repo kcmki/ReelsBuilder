@@ -1,829 +1,477 @@
 import sys
 import os
+import json
+import shutil
 import sqlite3
 import logging
-import traceback
-from pathlib import Path
-from datetime import datetime
-import json
-from datetime import timedelta
-import configparser
-from typing import List
-import time
 import threading
+import time
+import configparser
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional
+
 import uvicorn
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from moviepy import VideoFileClip
-# ensure src is importable
+
 ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "src"
-sys.path.insert(0, str(SRC))
+sys.path.insert(0, str(ROOT / "src"))
 
 from src.YoutubeExtractorHandler import YoutubeExtractorHandler
-from src.ClipBuilder import ClipBuilder
-from src.DriveHandler import GoogleDriveManager
+from src.ClipBuilder import ClipBuilder, coerce_edit, probe
 from src.InstagramHandler import InstagramHandler
-from src.SupabaseS3Handler import SupabaseS3Handler
 
 DB_PATH = Path(os.getenv("DB_PATH", str(ROOT / "reels_manager.db")))
 LOG_PATH = Path(os.getenv("LOG_PATH", str(ROOT / "reels_manager.log")))
+# settings edited from the dashboard must live on a volume, or they vanish on redeploy
+SETTINGS_PATH = Path(os.getenv("SETTINGS_PATH", str(ROOT / "settings.ini")))
+LOGO_DIR = ROOT / "data" / "logos"
+MAX_PUBLISH_ATTEMPTS = 3
 
 logger = logging.getLogger("reels_manager")
 logger.setLevel(logging.INFO)
-# ensure log directory exists
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-logger.addHandler(handler)
-logger.addHandler(logging.StreamHandler())
+_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+for _h in (logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()):
+    _h.setFormatter(_fmt)
+    logger.addHandler(_h)
 
-def delete_local_files(*paths, label="after upload"):
-    """Helper to delete local video files and empty parent directories."""
-    for p in paths:
-        try:
-            if p and os.path.exists(p):
-                os.remove(p)
-                logger.info(f"Deleted local file {label}: {p}")
-                
-                # Try to remove parent directory if it's empty (e.g. clips/video_id/)
-                parent = os.path.dirname(p)
-                if os.path.exists(parent) and not os.listdir(parent):
-                    # check if it's within clips or reels to avoid deleting root folders
-                    parent_name = os.path.basename(os.path.dirname(parent))
-                    if parent_name in ("clips", "reels"):
-                        os.rmdir(parent)
-                        logger.info(f"Deleted empty directory: {parent}")
-        except Exception:
-            logger.exception(f"Failed deleting local file or directory {p}")
+
+def now() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def abspath(p: str) -> Path:
+    return Path(p) if os.path.isabs(p) else ROOT / p
+
+
+def delete_file(p: Optional[str]):
+    """Delete a media file and its folder once empty (never the reels/ root itself)."""
+    if not p:
+        return
+    fp = abspath(p)
+    try:
+        fp.unlink(missing_ok=True)
+        parent = fp.parent
+        while parent.is_dir() and ROOT / "reels" in parent.parents and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
+    except Exception:
+        logger.exception("Failed deleting %s", fp)
 
 
 def init_db(conn: sqlite3.Connection):
-    c = conn.cursor()
-    c.execute(
-        """
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS videos (
-            video_id TEXT PRIMARY KEY,
-            title TEXT,
-            url TEXT,
-            downloaded_at TEXT,
-            clips_created INTEGER DEFAULT 0,
-            drive_file_id TEXT,
-            drive_public_url TEXT,
-            instagram_media_id TEXT,
-            last_updated TEXT
-        )
-        """
-    )
-
-    c.execute(
-        """
+            video_id TEXT PRIMARY KEY, title TEXT, url TEXT, downloaded_at TEXT, clips_created INTEGER DEFAULT 0,
+            drive_file_id TEXT, drive_public_url TEXT, instagram_media_id TEXT, last_updated TEXT);
         CREATE TABLE IF NOT EXISTS clips (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            video_id TEXT,
-            clip_path TEXT,
-            reel_path TEXT,
-            duration REAL,
-            drive_file_id TEXT,
-            created_at TEXT
-        )
-        """
-    )
-
-    c.execute(
-        """
+            id INTEGER PRIMARY KEY AUTOINCREMENT, video_id TEXT, clip_path TEXT, reel_path TEXT, duration REAL,
+            drive_file_id TEXT, created_at TEXT);
         CREATE TABLE IF NOT EXISTS interactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT, external_id TEXT, type TEXT, payload TEXT,
+            replied_at TEXT);
+        CREATE TABLE IF NOT EXISTS accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            platform TEXT,
-            external_id TEXT,
-            type TEXT,
-            payload TEXT,
-            replied_at TEXT
-        )
-        """
-    )
-
-    conn.commit()
-    # add soft-delete columns if they don't exist (safe on SQLite)
-    try:
-        c.execute("ALTER TABLE clips ADD COLUMN deleted_at TEXT")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE clips ADD COLUMN drive_deleted INTEGER DEFAULT 0")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE clips ADD COLUMN published INTEGER DEFAULT 0")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE clips ADD COLUMN published_at TEXT")
-    except Exception:
-        pass
+            name TEXT NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            ig_business_id TEXT NOT NULL,
+            page_id TEXT,
+            access_token TEXT NOT NULL,
+            cron TEXT DEFAULT '0 * * * *',
+            queries TEXT DEFAULT '',
+            caption TEXT DEFAULT '',
+            reply_message TEXT DEFAULT '',
+            edit TEXT DEFAULT '{}',
+            created_at TEXT);
+    """)
+    for table, col in [
+        ("clips", "deleted_at TEXT"), ("clips", "drive_deleted INTEGER DEFAULT 0"),
+        ("clips", "published INTEGER DEFAULT 0"), ("clips", "published_at TEXT"),
+        ("clips", "account_id INTEGER"), ("clips", "title TEXT"), ("clips", "attempts INTEGER DEFAULT 0"),
+        ("clips", "error TEXT"), ("clips", "ig_media_id TEXT"),
+        ("videos", "account_id INTEGER"), ("interactions", "account_id INTEGER"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass  # already exists
     conn.commit()
 
 
-def load_settings(path: Path) -> configparser.ConfigParser:
+def load_settings() -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
-    # explicit encoding
-    with open(path, encoding="utf-8") as f:
-        cfg.read_file(f)
+    # repo defaults first, then the persisted copy on top (so new default keys still appear)
+    cfg.read([ROOT / "settings.ini", SETTINGS_PATH], encoding="utf-8")
     return cfg
 
 
+def fill(template: str, **values) -> str:
+    """str.format without blowing up on stray braces in user-written captions."""
+    for k, v in values.items():
+        template = template.replace("{" + k + "}", str(v or ""))
+    return template
+
+
 class ReelsManager:
+    settings_path, log_path, logo_dir = SETTINGS_PATH, LOG_PATH, LOGO_DIR
+    abspath = staticmethod(abspath)
+
     def __init__(self, cfg: configparser.ConfigParser):
         self.cfg = cfg
-        # allow using the connection from APScheduler worker threads
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        # lock to protect concurrent DB access
         self.db_lock = threading.RLock()
+        # ponytail: one global render lock — download+ffmpeg is CPU/disk bound on one box anyway
+        self.render_lock = threading.Lock()
         init_db(self.conn)
-
         self.extractor = YoutubeExtractorHandler()
-        self.clip_builder = ClipBuilder()
-        self.ig = InstagramHandler()
-
-        # settings
-        self.queries = [q.strip() for q in cfg.get("search", "queries").split("||") if q.strip()]
-        self.search_limit = cfg.getint("search", "limit", fallback=10)
-        self.max_limit = cfg.getint("search", "max_limit", fallback=100)
-        self.min_clip_duration = cfg.getint("clips", "min_duration", fallback=20)
-        self.reply_message = cfg.get("interactions", "reply_message", fallback="Thanks for reaching out! We will get back to you.")
-        # instagram caption template for reels (can use {video_id} and {title})
-        self.reels_caption = cfg.get("instagram", "reels_caption", fallback="Auto-upload {video_id}")
-        # allow disabling interactions (DMs/comments) when desired via CLI
+        self.scheduler: Optional[BackgroundScheduler] = None
         self.interactions_enabled = True
+        self.seed_default_account()
 
-    # --- helper DB methods ---
-    def video_exists(self, video_id: str) -> bool:
+    # --- db helpers ------------------------------------------------------------------
+    def q(self, sql: str, args=(), one=False):
         with self.db_lock:
-            cur = self.conn.cursor()
-            cur.execute("SELECT 1 FROM videos WHERE video_id=?", (video_id,))
-            return cur.fetchone() is not None
+            rows = [dict(r) for r in self.conn.execute(sql, args).fetchall()]
+        return (rows[0] if rows else None) if one else rows
 
-    def mark_video(self, video_id: str, **fields):
-        now = datetime.utcnow().isoformat()
+    def x(self, sql: str, args=()) -> sqlite3.Cursor:
         with self.db_lock:
-            cur = self.conn.cursor()
-
-        # sanitize fields: JSON-serialize dicts/lists to avoid sqlite binding errors
-        safe_fields = {}
-        for k, v in fields.items():
-            if k == "last_updated":
-                # we'll set last_updated ourselves
-                continue
-            if isinstance(v, (dict, list)):
-                try:
-                    safe_fields[k] = json.dumps(v, ensure_ascii=False)
-                except Exception:
-                    safe_fields[k] = str(v)
-            else:
-                safe_fields[k] = v
-
-            if self.video_exists(video_id):
-                if safe_fields:
-                    sets = ",".join([f"{k}=?" for k in safe_fields.keys()])
-                    values = list(safe_fields.values()) + [now, video_id]
-                    cur.execute(f"UPDATE videos SET {sets}, last_updated=? WHERE video_id=?", values)
-                else:
-                    cur.execute("UPDATE videos SET last_updated=? WHERE video_id=?", (now, video_id))
-            else:
-                cur.execute(
-                    "INSERT INTO videos (video_id, title, url, downloaded_at, clips_created, drive_file_id, drive_public_url, instagram_media_id, last_updated) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (
-                        video_id,
-                        safe_fields.get("title"),
-                        safe_fields.get("url"),
-                        safe_fields.get("downloaded_at"),
-                        safe_fields.get("clips_created", 0),
-                        safe_fields.get("drive_file_id"),
-                        safe_fields.get("drive_public_url"),
-                        safe_fields.get("instagram_media_id"),
-                        now,
-                    ),
-                )
+            cur = self.conn.execute(sql, args)
             self.conn.commit()
+            return cur
+
+    def video_exists(self, video_id: str) -> bool:
+        return self.q("SELECT 1 FROM videos WHERE video_id=?", (video_id,), one=True) is not None
 
     def interaction_exists(self, platform: str, external_id: str) -> bool:
-        with self.db_lock:
-            cur = self.conn.cursor()
-            cur.execute("SELECT 1 FROM interactions WHERE platform=? AND external_id=?", (platform, external_id))
-            return cur.fetchone() is not None
+        return self.q("SELECT 1 FROM interactions WHERE platform=? AND external_id=?",
+                      (platform, external_id), one=True) is not None
 
-    def record_interaction(self, platform: str, external_id: str, itype: str, payload: str = ""):
-        with self.db_lock:
-            cur = self.conn.cursor()
-            cur.execute(
-                "INSERT INTO interactions (platform, external_id, type, payload, replied_at) VALUES (?,?,?,?,?)",
-                (platform, external_id, itype, payload, datetime.utcnow().isoformat()),
-            )
-            self.conn.commit()
+    def record_interaction(self, platform, external_id, itype, payload="", account_id=None):
+        self.x("INSERT INTO interactions (platform, external_id, type, payload, replied_at, account_id) "
+               "VALUES (?,?,?,?,?,?)", (platform, external_id, itype, payload, now(), account_id))
 
-    # --- main processes ---
-    def search_download_publish(self):
-        logger.info("Starting search_download_publish run")
-        # If there are pending local/unpublished reels, publish one and skip searching
-        pending = self.publish_pending_reels()
-        if pending:
-            logger.info("Processed a pending reel; skipping new search/download this run")
+    # --- accounts --------------------------------------------------------------------
+    def seed_default_account(self):
+        """First boot after the multi-account upgrade: turn the old env-var account into account #1."""
+        if self.q("SELECT 1 FROM accounts LIMIT 1", one=True):
             return
-        # track uploads this run to avoid flooding (only one reel upload per run)
-        uploads_done = 0
-        for query in self.queries:
-            # start from configured base limit and increase (doubling) until we find a new video
-            base_limit = self.search_limit
-            max_limit = self.max_limit
-            limit = base_limit
-            results = []
+        token, ig_id = os.getenv("LONG_TIME_ACCESS_TOKEN"), os.getenv("INSTAGRAM_BUISINESS_ACCOUNT")
+        if not token and os.getenv("USER_TOKEN") and os.getenv("APP_ID") and os.getenv("APP_SECRET"):
+            try:
+                token = InstagramHandler.exchange_long_lived_token(
+                    os.getenv("APP_ID"), os.getenv("APP_SECRET"), os.getenv("USER_TOKEN"))
+            except Exception:
+                logger.exception("Long-lived token exchange failed")
+        if not (token and ig_id):
+            logger.warning("No accounts configured — add one from the dashboard")
+            return
+        c = self.cfg
+        acc_id = self.save_account(None, {
+            "name": "default",
+            "ig_business_id": ig_id,
+            "page_id": os.getenv("FB_PAGE_ID", ""),
+            "access_token": token,
+            "cron": c.get("scheduler", "search_cron", fallback="0 * * * *"),
+            "queries": "\n".join(q.strip() for q in c.get(
+                "search", "queries", fallback="Supercars on the road || Exotic cars in the city || Luxury cars in action || "
+                          "Sports cars on track").split("||")),
+            "caption": c.get("instagram", "reels_caption", fallback=(
+                "Built for the road, driven by passion. Every rev tells a story. 💨🏁 #cars #carsofinstagram "
+                "#carlovers #carreels #auto #automotive #carlife #carswithoutlimits #dreamcars #luxurycars "
+                "#sportscars #engine #reels #instareels #explorepage")),
+            "reply_message": c.get("interactions", "reply_message",
+                                   fallback="Thanks for interacting with us! Make sure to follow for more content!"),
+            "edit": {"clips_count": c.getint("clips", "clips_count", fallback=10),
+                     "clip_length": c.getint("clips", "min_duration", fallback=20)},
+        }, schedule=False)
+        for table in ("videos", "clips", "interactions"):
+            self.x(f"UPDATE {table} SET account_id=? WHERE account_id IS NULL", (acc_id,))
+        logger.info("Seeded account #%s from environment variables", acc_id)
 
-            while True:
-                logger.info(f"Searching '{query}' (limit={limit})")
-                try:
-                    results = self.extractor.search_videos(query=query, limit=limit, sort_by=self.cfg.get("search", "sort_by", fallback="popular"))
-                except Exception:
-                    logger.exception("Search failed")
-                    results = []
-                    break
+    def get_account(self, account_id: int) -> Optional[dict]:
+        acc = self.q("SELECT * FROM accounts WHERE id=?", (account_id,), one=True)
+        if acc:
+            acc["edit"] = coerce_edit(json.loads(acc["edit"] or "{}"))
+            acc["queries_list"] = [q.strip() for q in (acc["queries"] or "").splitlines() if q.strip()]
+        return acc
 
-                # determine if any returned video is new (not in DB)
-                any_new = False
-                for v in results:
-                    vid = None
-                    if isinstance(v, dict):
-                        vid = v.get("videoId") or v.get("id") or v.get("video_id")
-                    else:
-                        s = str(v)
-                        if "watch?v=" in s:
-                            vid = s.split("watch?v=")[-1].split("&")[0]
-                    if vid and not self.video_exists(vid):
-                        any_new = True
-                        break
+    def list_accounts(self) -> list:
+        return [self.get_account(r["id"]) for r in self.q("SELECT id FROM accounts ORDER BY id")]
 
-                # if we found any new video or we've reached max_limit, stop increasing
-                if any_new or limit >= max_limit:
-                    break
+    def logo_path(self, account_id: int) -> Optional[str]:
+        for p in (LOGO_DIR / f"{account_id}.png", ROOT / "logo" / "logo.png"):
+            if p.exists():
+                return str(p)
+        return None
 
-                # otherwise increase limit and retry (double, capped at max_limit)
-                next_limit = min(max_limit, limit * 2)
-                if next_limit == limit:
-                    break
-                logger.info("No new videos for query '%s'. Increasing limit %s->%s", query, limit, next_limit)
-                limit = next_limit
+    def save_account(self, account_id: Optional[int], data: dict, schedule=True) -> int:
+        """Create (account_id=None) or update. Raises ValueError on bad input."""
+        current = self.get_account(account_id) if account_id else None
+        if account_id and not current:
+            raise ValueError("account not found")
+        merged = {**(current or {}), **{k: v for k, v in data.items() if v is not None}}
+        if not data.get("access_token") and current:
+            merged["access_token"] = current["access_token"]  # blank field in the form = keep token
+        for req in ("name", "ig_business_id", "access_token"):
+            if not str(merged.get(req) or "").strip():
+                raise ValueError(f"{req} is required")
+        cron = (merged.get("cron") or "0 * * * *").strip()
+        CronTrigger.from_crontab(cron)  # raises ValueError if invalid
+        row = (
+            str(merged["name"]).strip(), 1 if merged.get("enabled", 1) not in (0, "0", False, "off") else 0,
+            str(merged["ig_business_id"]).strip(), str(merged.get("page_id") or "").strip(),
+            str(merged["access_token"]).strip(), cron, merged.get("queries") or "",
+            merged.get("caption") or "", merged.get("reply_message") or "",
+            json.dumps(coerce_edit(merged.get("edit"))),
+        )
+        cols = "name, enabled, ig_business_id, page_id, access_token, cron, queries, caption, reply_message, edit"
+        if account_id:
+            self.x(f"UPDATE accounts SET {', '.join(c + '=?' for c in cols.split(', '))} WHERE id=?",
+                   (*row, account_id))
+        else:
+            account_id = self.x(f"INSERT INTO accounts ({cols}, created_at) VALUES ({'?,' * 10}?)",
+                                (*row, now())).lastrowid
+        if schedule:
+            self.schedule_account(account_id)
+        return account_id
 
-            new_found = 0
-            for video in results:
-                # try to extract a video id/url robustly
-                video_id = None
-                url = None
-                if isinstance(video, dict):
-                    video_id = video.get("videoId") or video.get("id") or video.get("video_id")
-                    url = video.get("url") or video.get("watchUrl")
-                else:
-                    # some libraries return strings
-                    url = str(video)
+    def delete_account(self, account_id: int):
+        if self.scheduler and self.scheduler.get_job(f"account_{account_id}"):
+            self.scheduler.remove_job(f"account_{account_id}")
+        for c in self.q("SELECT reel_path FROM clips WHERE account_id=? AND published=0 AND deleted_at IS NULL",
+                        (account_id,)):
+            delete_file(c["reel_path"])
+        self.x("UPDATE clips SET deleted_at=? WHERE account_id=? AND deleted_at IS NULL", (now(), account_id))
+        self.x("DELETE FROM accounts WHERE id=?", (account_id,))
+        (LOGO_DIR / f"{account_id}.png").unlink(missing_ok=True)
 
-                if not video_id and url:
-                    # try to parse id from url
-                    if "watch?v=" in url:
-                        video_id = url.split("watch?v=")[-1].split("&")[0]
+    def schedule_account(self, account_id: int):
+        if not self.scheduler:
+            return
+        job_id = f"account_{account_id}"
+        acc = self.get_account(account_id)
+        if not acc or not acc["enabled"]:
+            if self.scheduler.get_job(job_id):
+                self.scheduler.remove_job(job_id)
+            return
+        self.scheduler.add_job(self.run_account, CronTrigger.from_crontab(acc["cron"]), args=[account_id],
+                               id=job_id, name=f"Publish · {acc['name']}", replace_existing=True,
+                               max_instances=1, coalesce=True, misfire_grace_time=600)
 
-                if not video_id:
-                    logger.warning("Skipping result with no video id")
-                    continue
+    def ig(self, acc: dict) -> InstagramHandler:
+        return InstagramHandler(acc["access_token"], acc["ig_business_id"], acc.get("page_id"))
 
-                if self.video_exists(video_id):
-                    continue
-
-                new_found += 1
-                try:
-                    logger.info(f"Processing new video {video_id}")
-                    temp_dir = ROOT / "temp"
-                    temp_dir.mkdir(exist_ok=True)
-                    temp_video_path = temp_dir / f"{video_id}.mp4"
-
-                    # download
-                    dl_path = self.extractor.download_video(url or f"https://www.youtube.com/watch?v={video_id}", str(temp_video_path))
-                    logger.info(f"Downloaded to {dl_path}")
-
-                    # extract points
-                    try:
-                        points = self.extractor.get_points(url or f"https://www.youtube.com/watch?v={video_id}", top_x=self.cfg.getint("clips", "clips_count", fallback=5))
-                    except Exception:
-                        logger.exception("get_points_concatenated failed")
-                        raise Exception("Failed extracting points")
-                    if not points:
-                        # Fallback: evenly spaced clips across full video duration
-                        try:
-                            with VideoFileClip(str(dl_path)) as vfc:
-                                total_ms = int(vfc.duration * 1000)
-                        except Exception:
-                            logger.warning(f"No markers and can't read duration for {video_id} — skipping")
-                            self.mark_video(video_id, title=video.get("title") if isinstance(video, dict) else None, url=url, downloaded_at=datetime.utcnow().isoformat(), clips_created=0)
-                            delete_local_files(str(temp_video_path), label="no markers")
-                            continue
-                        clips_count = self.cfg.getint("clips", "clips_count", fallback=5)
-                        clip_ms = max(self.cfg.getint("clips", "min_duration", fallback=20), 30) * 1000
-                        spacing_ms = total_ms // (clips_count + 1)
-                        points = [
-                            {"startMillis": spacing_ms * (i + 1), "durationMillis": clip_ms, "intensityScoreNormalized": 1.0}
-                            for i in range(clips_count)
-                            if spacing_ms * (i + 1) + clip_ms <= total_ms
-                        ]
-                        if points:
-                            logger.info(f"No markers for {video_id} — using {len(points)} evenly spaced fallback clips")
-                        else:
-                            logger.warning(f"Video {video_id} too short for fallback clips — skipping")
-                            self.mark_video(video_id, title=video.get("title") if isinstance(video, dict) else None, url=url, downloaded_at=datetime.utcnow().isoformat(), clips_created=0)
-                            delete_local_files(str(temp_video_path), label="too short")
-                            continue
-                    # build reels
-                    cb = ClipBuilder(temp_video_path=str(dl_path))
-                    clips_dir = ROOT / "clips" / video_id
-                    reels_dir = ROOT / "reels" / video_id
-                    clips_dir.mkdir(parents=True, exist_ok=True)
-                    reels_dir.mkdir(parents=True, exist_ok=True)
-
-                    cb.build_reels_from_points(points, clips_dir=str(clips_dir), reels_dir=str(reels_dir))
-                    
-                    # delete the base video immediately after reels are created to save space and avoid reuse
-                    delete_local_files(str(temp_video_path), label="after clipping")
-
-                    # collect reels and upload each to drive and make public; record each clip in DB
-                    reels = sorted(reels_dir.glob("*.mp4"))
-                    clips_added = 0
-                    stop_all = False
-                    for reel in reels:
-                        if uploads_done >= 1:
-                            # do not upload more than one reel per run; record as not published
-                            try:
-                                original_name = reel.name
-                                if original_name.startswith("reels_"):
-                                    orig_clip_name = original_name.replace("reels_", "", 1)
-                                else:
-                                    orig_clip_name = original_name
-
-                                clip_path = str(clips_dir / orig_clip_name)
-                                reel_path = str(reel)
-
-                                # Store relative paths in DB for portability
-                                clip_rel_path = os.path.relpath(clip_path, ROOT)
-                                reel_rel_path = os.path.relpath(reel_path, ROOT)
-
-                                with self.db_lock:
-                                    cur = self.conn.cursor()
-                                    cur.execute(
-                                        "INSERT INTO clips (video_id, clip_path, reel_path, duration, drive_file_id, created_at, published, published_at) VALUES (?,?,?,?,?,?,?,?)",
-                                        (video_id, clip_rel_path, reel_rel_path, duration, None, datetime.utcnow().isoformat(), 0, None),
-                                    )
-                                    self.conn.commit()
-                                clips_added += 1
-                                logger.info(f"Recorded clip (unpublished) in DB: {reel_path}")
-                            except Exception:
-                                logger.exception("Failed recording (unpublished) clip metadata for %s", reel)
-
-                            continue
-
-                        try:
-                            # Direct resumable upload to Meta (rupload) flow
-                            reel_path = str(reel)
-                            caption = self.reels_caption.format(video_id=video_id, title=(video.get("title") if isinstance(video, dict) else ""))
-                            # Step 1: create resumable media container
-                            try:
-                                
-                                video = VideoFileClip(reel_path)
-                                duration = int(video.duration)
-                                thumb_offset = max(1, duration // 2)
-                                resp = self.ig.create_resumable_media_container(media_type="REELS", caption=caption, thumb_offset=thumb_offset)
-                                container_id = resp.get("id")
-                                upload_uri = resp.get("uri") or resp.get("uri") or resp.get("upload_url")
-                                if not container_id or not upload_uri:
-                                    raise RuntimeError(f"Invalid resumable container response: {resp}")
-                            except Exception:
-                                logger.exception("Failed creating resumable container for %s", reel_path)
-                                raise
-
-                            # Step 2: upload to rupload
-                            try:
-                                # compute thumb_offset
-                                try:
-                                    with VideoFileClip(reel_path) as vfc:
-                                        thumb_offset = int(vfc.duration // 2)
-                                except Exception:
-                                    thumb_offset = None
-
-                                # upload local file
-                                self.ig.upload_resumable_video(upload_uri, local_path=reel_path)
-                            except Exception:
-                                logger.exception("Failed uploading to rupload for %s", reel_path)
-                                raise
-
-                            # Step 3: poll container status then publish
-                            try:
-                                for i in range(60):
-                                    st = self.ig.get_container_video_status(container_id)
-                                    video_status = st.get("video_status") or {}
-                                    uploading = video_status.get("uploading_phase", {}).get("status")
-                                    processing = video_status.get("processing_phase", {}).get("status")
-                                    if uploading == "complete" and processing in ("complete", "succeeded", "done"):
-                                        break
-                                    if uploading == "error" or processing == "error":
-                                        raise RuntimeError(f"Upload/processing error: {st}")
-                                    logger.info("Container %s status uploading=%s processing=%s", container_id, uploading, processing)
-                                    time.sleep(5)
-
-                                # publish
-                                self.ig.publish_media(container_id)
-                                logger.info(f"Published to Instagram: creation_id={container_id}")
-                            except Exception:
-                                logger.exception("Failed publishing container %s", container_id)
-                                raise
-
-                            # record clip/reel in DB (published)
-                            try:
-                                original_name = reel.name
-                                if original_name.startswith("reels_"):
-                                    orig_clip_name = original_name.replace("reels_", "", 1)
-                                else:
-                                    orig_clip_name = original_name
-
-                                clip_path = str(clips_dir / orig_clip_name)
-                                reel_path = str(reel)
-
-                                # try to get duration using moviepy if available
-                                duration = None
-                                try:
-                                    with VideoFileClip(reel_path) as vfc:
-                                        duration = float(vfc.duration)
-                                except Exception:
-                                    duration = None
-
-                                # Store relative paths in DB for portability
-                                clip_rel_path = os.path.relpath(clip_path, ROOT)
-                                reel_rel_path = os.path.relpath(reel_path, ROOT)
-
-                                with self.db_lock:
-                                    cur = self.conn.cursor()
-                                    cur.execute(
-                                        "INSERT INTO clips (video_id, clip_path, reel_path, duration, drive_file_id, created_at, published, published_at) VALUES (?,?,?,?,?,?,?,?)",
-                                        (video_id, clip_rel_path, reel_rel_path, duration, None, datetime.utcnow().isoformat(), 1, datetime.utcnow().isoformat()),
-                                    )
-                                    self.conn.commit()
-                                clips_added += 1
-                                logger.info(f"Recorded clip in DB: {reel_path}")
-                                # delete local files after successful upload
-                                delete_local_files(reel_path, clip_path)
-
-                                # we uploaded/published one reel this run; stop further processing to avoid flooding
-                                uploads_done += 1
-                                stop_all = True
-                                break
-                            except Exception:
-                                logger.exception("Failed recording clip metadata for %s", reel)
-                                
-                        except Exception:
-                            logger.exception(f"Failed upload/publish for {reel}")
-
-                    # update video record with clips count and last metadata
-                    # WE DO THIS BEFORE THE BREAK to ensure the video is marked as processed
-                    try:
-                        self.mark_video(
-                            video_id,
-                            title=video.get("title") if isinstance(video, dict) else None,
-                            url=url,
-                            downloaded_at=datetime.utcnow().isoformat(),
-                            clips_created=clips_added,
-                            last_updated=datetime.utcnow().isoformat(),
-                        )
-                    except Exception:
-                        logger.exception("Failed updating video record for %s", video_id)
-
-                    if stop_all:
-                        # break out to stop processing more reels/videos this run
-                        break
-
-                except Exception:
-                    logger.exception(f"Failed processing video {video_id}")
-
-            # if no new results, increase limit next run up to max
-            # if we already uploaded a reel this run, stop processing further queries/videos
-            if uploads_done >= 1:
-                logger.info("Uploaded one reel this run; stopping further processing of queries")
-                break
-
-            if new_found == 0:
-                new_limit = min(self.search_limit * 2, self.max_limit)
-                if new_limit > self.search_limit:
-                    logger.info(f"No new videos for query '{query}'. Increasing limit {self.search_limit}->{new_limit}")
-                    self.search_limit = new_limit
-
-        logger.info("search_download_publish run completed")
-
-    def respond_interactions(self):
-        logger.info("Starting respond_interactions run")
+    # --- pipeline --------------------------------------------------------------------
+    def run_account(self, account_id: int):
+        """Scheduled job: publish one queued reel; if the queue is empty, make new ones first."""
+        acc = self.get_account(account_id)
+        if not acc or not acc["enabled"]:
+            return
+        tag = f"[{acc['name']}]"
+        logger.info("%s run started", tag)
         try:
-            # DMs / Conversations
-            convs = self.ig.list_conversations()
-            for conv in convs:
-                conv_id = conv.get("id")
-                messages = self.ig.get_conversation_messages(conv_id, limit=20)
-                for msg in messages:
-                    mid = msg.get("id")
-                    sender = msg.get("from", {}).get("id")
-                    text = msg.get("message") or msg.get("text") or ""
-                    if not mid or self.interaction_exists("instagram_dm", mid):
-                        continue
-                    # avoid replying to ourselves
-                    if sender == str(self.ig.page_id):
-                        self.record_interaction("instagram_dm", mid, "skipped_self", text)
-                        continue
-
-                    # reply
-                    try:
-                        self.ig.dm_user(sender, self.reply_message)
-                        self.record_interaction("instagram_dm", mid, "replied", text)
-                        logger.info(f"Replied to DM {mid}")
-                    except Exception:
-                        logger.exception(f"Failed replying to DM {mid}")
-
-            # Comments on published media
-            media = self.ig.list_published_media(limit=50)
-            for m in media:
-                media_id = m.get("id")
-                comments = self.ig.list_media_comments(media_id, limit=50)
-                for c in comments:
-                    cid = c.get("id")
-                    if not cid or self.interaction_exists("instagram_comment", cid):
-                        continue
-                    try:
-                        self.ig.reply_to_comment(cid, self.reply_message)
-                        self.record_interaction("instagram_comment", cid, "replied", c.get("text", ""))
-                        logger.info(f"Replied to comment {cid}")
-                    except Exception:
-                        logger.exception(f"Failed replying to comment {cid}")
-
+            if self.publish_next(acc):
+                return
+            for query in acc["queries_list"]:
+                video = self.find_new_video(query)
+                if video and self.process_video(acc, video["video_id"], title=video["title"]):
+                    self.publish_next(acc)
+                    return
+            logger.info("%s nothing new to publish", tag)
         except Exception:
-            logger.exception("respond_interactions failed")
+            logger.exception("%s run failed", tag)
+        finally:
+            logger.info("%s run completed", tag)
 
-        logger.info("respond_interactions run completed")
+    def find_new_video(self, query: str) -> Optional[dict]:
+        limit = self.cfg.getint("search", "limit", fallback=5)
+        max_limit = self.cfg.getint("search", "max_limit", fallback=100)
+        sort_by = self.cfg.get("search", "sort_by", fallback="relevance")
+        while True:
+            logger.info("Searching '%s' (limit=%s)", query, limit)
+            try:
+                results = self.extractor.search_videos(query, limit=limit, sort_by=sort_by)
+            except Exception:
+                logger.exception("Search failed for '%s'", query)
+                return None
+            for v in results:
+                if not self.video_exists(v["video_id"]):
+                    return v
+            if limit >= max_limit or len(results) < limit:
+                return None
+            limit = min(limit * 2, max_limit)
 
-    def publish_pending_reels(self) -> int:
-        """Find local reels (under reels/) that are not marked published and publish them.
-        Returns the number of reels processed.
+    def process_video(self, acc: dict, video_id: str, title: str = "", force: bool = False) -> list:
+        """Download + render reels into the account's queue. Returns new clip ids.
+
+        The video row is claimed *before* downloading so two accounts never grab the same video,
+        and a video that crashes the pipeline isn't retried forever.
         """
-        with self.db_lock:
-            cur = self.conn.cursor()
-            # find clips rows that are not published and not soft-deleted
-            cur.execute("SELECT id, video_id, reel_path FROM clips WHERE published=0 AND (deleted_at IS NULL OR deleted_at='')")
-            rows = cur.fetchall()
-
-        processed = 0
-
-        # If DB has none, scan reels/ folder for any mp4s not recorded as published
-        if not rows:
-            reels_root = ROOT / "reels"
-            if reels_root.exists():
-                for video_dir in reels_root.iterdir():
-                    if not video_dir.is_dir():
-                        continue
-                    for fp in video_dir.glob("*.mp4"):
-                        pstr = str(fp)
-                        rel_pstr = os.path.relpath(fp, ROOT)
-                        # check if there's a clip row for this path and published=1
-                        # check both absolute and relative for backward compatibility
-                        with self.db_lock:
-                            cur = self.conn.cursor()
-                            cur.execute("SELECT id, published FROM clips WHERE reel_path=? OR reel_path=?", (pstr, rel_pstr))
-                            r = cur.fetchone()
-                        if r is None:
-                            rows.append((None, video_dir.name, pstr))
-                        else:
-                            if r[1] == 0:
-                                rows.append((r[0], video_dir.name, pstr))
-
-        if not rows:
-            return 0
-
-        # group by video_id
-        groups = {}
-        for rid, vid, path in rows:
-            groups.setdefault(vid, []).append((rid, path))
-
-        for vid, items in groups.items():
-            logger.info(f"Publishing pending reels for video {vid} ({len(items)} items)")
-            for rid, reel_path in items:
-                try:
-                    # create container
-                    caption = self.reels_caption.format(video_id=vid, title="")
-                    video = VideoFileClip(reel_path)
-                    thumb_offset = int(video.duration // 2)
-                    resp = self.ig.create_resumable_media_container(media_type="REELS", caption=caption,thumb_offset=thumb_offset)
-                    container_id = resp.get("id")
-                    upload_uri = resp.get("uri") or resp.get("upload_url")
-                    if not container_id or not upload_uri:
-                        logger.error("Invalid resumable response for %s: %s", reel_path, resp)
-                        continue
-
-                    # upload
-                    try:
-                        self.ig.upload_resumable_video(upload_uri, local_path=reel_path)
-                    except Exception:
-                        logger.exception("Upload failed for %s", reel_path)
-                        continue
-
-                    # poll and publish
-                    for i in range(60):
-                        st = self.ig.get_container_video_status(container_id)
-                        vs = st.get("video_status", {})
-                        up = vs.get("uploading_phase", {}).get("status")
-                        pr = vs.get("processing_phase", {}).get("status")
-                        if up == "complete" and pr in ("complete", "succeeded", "done"):
-                            break
-                        if up == "error" or pr == "error":
-                            logger.error("Upload/processing error for %s: %s", reel_path, st)
-                            break
-                        time.sleep(5)
-
-                    try:
-                        self.ig.publish_media(container_id)
-                        logger.info("Published pending reel %s -> container %s", reel_path, container_id)
-                    except Exception:
-                        logger.exception("Failed publishing container %s", container_id)
-                        continue
-
-                    # mark DB row published or insert if missing
-                    now = datetime.utcnow().isoformat()
-                    if rid:
-                        try:
-                                    with self.db_lock:
-                                        cur.execute("UPDATE clips SET published=1, published_at=? WHERE id=?", (now, rid))
-                                        self.conn.commit()
-                        except Exception:
-                            logger.exception("Failed marking clip id %s as published", rid)
-                    else:
-                        try:
-                            # insert record
-                            with self.db_lock:
-                                cur.execute(
-                                    "INSERT INTO clips (video_id, clip_path, reel_path, duration, drive_file_id, created_at, published, published_at) VALUES (?,?,?,?,?,?,?,?)",
-                                    (vid, None, os.path.relpath(reel_path, ROOT), None, None, now, 1, now),
-                                )
-                                self.conn.commit()
-                        except Exception:
-                            logger.exception("Failed inserting clip row for %s", reel_path)
-
-                    processed += 1
-                    # delete local files after successful upload
-                    delete_local_files(reel_path)
-                    # only publish one reel per run to avoid flooding
-                    return processed
-                except Exception:
-                    logger.exception("Failed processing pending reel %s", reel_path)
-
-        return processed
-
-    def cleanup_storage(self):
-        """Delete Drive files and local clips older than retention period."""
-        logger.info("Starting cleanup_storage run")
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        claimed = self.x("INSERT OR IGNORE INTO videos (video_id, title, url, downloaded_at, account_id, "
+                         "last_updated) VALUES (?,?,?,?,?,?)",
+                         (video_id, title, url, now(), acc["id"], now())).rowcount
+        if not claimed and not force:
+            return []
+        tag = f"[{acc['name']}]"
+        source = ROOT / "temp" / f"{video_id}.mp4"
+        out_dir = ROOT / "reels" / str(acc["id"]) / f"{video_id}_{int(time.time())}"
+        clip_ids = []
         try:
-            keep_days = self.cfg.getint("cleanup", "keep_days", fallback=7)
-            cutoff = datetime.utcnow() - timedelta(days=keep_days)
-
-            with self.db_lock:
-                cur = self.conn.cursor()
-                cur.execute("SELECT id, reel_path, clip_path, drive_file_id, created_at FROM clips")
-                rows = cur.fetchall()
-
-            for r in rows:
-                cid_db, reel_path, clip_path, drive_id, created_at = r
-                try:
-                    created_dt = datetime.fromisoformat(created_at) if created_at else None
-                except Exception:
-                    created_dt = None
-
-                # delete if older than cutoff
-                if created_dt and created_dt < cutoff:
-                    # delete local files
-                    # paths in DB might be relative or absolute
-                    for p in (reel_path, clip_path):
-                        if not p: continue
-                        abs_p = p if os.path.isabs(p) else str(ROOT / p)
-                        try:
-                            if os.path.exists(abs_p):
-                                os.remove(abs_p)
-                                logger.info(f"Deleted local file {abs_p}")
-                                
-                                # Try to remove parent directory if it's empty
-                                parent = os.path.dirname(abs_p)
-                                if os.path.exists(parent) and not os.listdir(parent):
-                                    parent_name = os.path.basename(os.path.dirname(parent))
-                                    if parent_name in ("clips", "reels"):
-                                        os.rmdir(parent)
-                                        logger.info(f"Deleted empty directory: {parent}")
-                        except Exception:
-                            logger.exception(f"Failed deleting local file {abs_p}")
-
-                    # delete drive file if present
-                    if drive_id:
-                        try:
-                            self.drive.delete_file(drive_id)
-                            logger.info(f"Deleted Drive file {drive_id}")
-                        except Exception:
-                            logger.exception(f"Failed deleting Drive file {drive_id}")
-                    # mark DB row as deleted (soft-delete), don't remove the row
-                    try:
-                        drive_deleted_flag = 0
-                        try:
-                            # if drive deletion was attempted above and succeeded, set flag
-                            # we don't have the success state from delete_file call, so assume success unless exception thrown
-                            drive_deleted_flag = 1 if drive_id else 0
-                        except Exception:
-                            drive_deleted_flag = 0
-                        with self.db_lock:
-                            cur.execute(
-                                "UPDATE clips SET deleted_at=?, drive_deleted=? WHERE id=?",
-                                (datetime.utcnow().isoformat(), drive_deleted_flag, cid_db),
-                            )
-                            self.conn.commit()
-                        logger.info(f"Marked clip row {cid_db} deleted in DB")
-                    except Exception:
-                        logger.exception("Failed marking clip row %s as deleted", cid_db)
-
-            # also clean any leftover files under clips/ and reels/ older than cutoff
-            for base in (ROOT / "clips", ROOT / "reels"):
-                for dirpath, dirnames, filenames in os.walk(base):
-                    for fn in filenames:
-                        fp = Path(dirpath) / fn
-                        try:
-                            mtime = datetime.utcfromtimestamp(fp.stat().st_mtime)
-                            if mtime < cutoff:
-                                fp.unlink()
-                                logger.info(f"Removed old file {fp}")
-                        except Exception:
-                            logger.exception(f"Failed handling file {fp}")
-
+            with self.render_lock:
+                logger.info("%s downloading %s", tag, video_id)
+                info = self.extractor.download_video(url, str(source))
+                title = info["title"] or title
+                logger.info("%s rendering %s (%s, heatmap=%s)", tag, video_id, acc["edit"]["mode"],
+                            bool(info["heatmap"]))
+                reels = ClipBuilder(acc["edit"], self.logo_path(acc["id"])).build(
+                    str(source), info["heatmap"], str(out_dir), title=title)
+            for reel in reels:
+                clip_ids.append(self.x(
+                    "INSERT INTO clips (video_id, account_id, reel_path, duration, title, created_at, published) "
+                    "VALUES (?,?,?,?,?,?,0)",
+                    (video_id, acc["id"], os.path.relpath(reel, ROOT), probe(reel)["duration"], title, now()),
+                ).lastrowid)
+            logger.info("%s queued %d reel(s) from %s", tag, len(clip_ids), video_id)
         except Exception:
-            logger.exception("cleanup_storage failed")
+            logger.exception("%s failed processing %s", tag, video_id)
+            shutil.rmtree(out_dir, ignore_errors=True)
+        finally:
+            source.unlink(missing_ok=True)
+            self.x("UPDATE videos SET title=?, clips_created=?, last_updated=? WHERE video_id=?",
+                   (title, len(clip_ids), now(), video_id))
+        return clip_ids
 
+    def publish_clip(self, acc: dict, clip: dict) -> bool:
+        tag = f"[{acc['name']}]"
+        path = abspath(clip["reel_path"])
+        if not path.exists():
+            self.x("UPDATE clips SET deleted_at=?, error='file missing' WHERE id=?", (now(), clip["id"]))
+            return False
+        caption = fill(acc["caption"], title=clip.get("title"), video_id=clip["video_id"])
+        try:
+            thumb_ms = int((clip.get("duration") or 2) * 1000 / 3)
+            media_id = self.ig(acc).publish_reel(str(path), caption, thumb_offset_ms=thumb_ms)
+        except Exception as e:
+            logger.exception("%s publish failed for clip %s", tag, clip["id"])
+            self.x("UPDATE clips SET attempts=attempts+1, error=? WHERE id=?", (str(e)[:500], clip["id"]))
+            return False
+        self.x("UPDATE clips SET published=1, published_at=?, ig_media_id=?, error=NULL WHERE id=?",
+               (now(), media_id, clip["id"]))
+        self.x("UPDATE videos SET instagram_media_id=? WHERE video_id=?", (media_id, clip["video_id"]))
+        logger.info("%s published clip %s -> media %s", tag, clip["id"], media_id)
+        delete_file(clip["reel_path"])
+        return True
+
+    def publish_next(self, acc: dict) -> bool:
+        """Publish the oldest queued reel for this account (one per run, to avoid flooding)."""
+        for clip in self.q("SELECT * FROM clips WHERE account_id=? AND published=0 AND deleted_at IS NULL "
+                           "AND attempts < ? ORDER BY id", (acc["id"], MAX_PUBLISH_ATTEMPTS)):
+            if self.publish_clip(acc, clip):
+                return True
+            if abspath(clip["reel_path"]).exists():
+                return False  # real API failure: stop, retry next run
+        return False
+
+    def delete_clip(self, clip_id: int):
+        clip = self.q("SELECT * FROM clips WHERE id=?", (clip_id,), one=True)
+        if clip:
+            delete_file(clip["reel_path"])
+            self.x("UPDATE clips SET deleted_at=? WHERE id=?", (now(), clip_id))
+
+    # --- interactions ----------------------------------------------------------------
+    def respond_interactions(self):
+        for acc in self.list_accounts():
+            if not acc["enabled"] or not acc["reply_message"]:
+                continue
+            tag = f"[{acc['name']}]"
+            try:
+                ig = self.ig(acc)
+                if acc["page_id"]:
+                    for conv in ig.list_conversations():
+                        for msg in ig.get_conversation_messages(conv.get("id"), limit=20):
+                            mid, sender = msg.get("id"), msg.get("from", {}).get("id")
+                            if not mid or self.interaction_exists("instagram_dm", mid):
+                                continue
+                            text = msg.get("message") or ""
+                            if sender in (acc["page_id"], acc["ig_business_id"]):
+                                self.record_interaction("instagram_dm", mid, "skipped_self", text, acc["id"])
+                                continue
+                            try:
+                                ig.dm_user(sender, acc["reply_message"])
+                                self.record_interaction("instagram_dm", mid, "replied", text, acc["id"])
+                            except Exception:
+                                logger.exception("%s failed replying to DM %s", tag, mid)
+                for m in ig.list_published_media(limit=50):
+                    for c in ig.list_media_comments(m.get("id"), limit=50):
+                        cid = c.get("id")
+                        if not cid or self.interaction_exists("instagram_comment", cid):
+                            continue
+                        try:
+                            ig.reply_to_comment(cid, acc["reply_message"])
+                            self.record_interaction("instagram_comment", cid, "replied", c.get("text", ""), acc["id"])
+                        except Exception:
+                            logger.exception("%s failed replying to comment %s", tag, cid)
+            except Exception:
+                logger.exception("%s respond_interactions failed", tag)
+
+    # --- cleanup ---------------------------------------------------------------------
+    def cleanup_storage(self):
+        """Delete local reels older than keep_days (published ones are already gone)."""
+        logger.info("Starting cleanup_storage run")
+        cutoff = datetime.utcnow() - timedelta(days=self.cfg.getint("cleanup", "keep_days", fallback=7))
+        for clip in self.q("SELECT id, reel_path, clip_path FROM clips WHERE deleted_at IS NULL AND created_at < ?",
+                           (cutoff.isoformat(),)):
+            delete_file(clip["reel_path"])
+            delete_file(clip["clip_path"])
+            self.x("UPDATE clips SET deleted_at=? WHERE id=?", (now(), clip["id"]))
+        for base in (ROOT / "clips", ROOT / "reels", ROOT / "temp"):
+            for fp in base.rglob("*"):
+                if fp.is_file() and datetime.utcfromtimestamp(fp.stat().st_mtime) < cutoff:
+                    delete_file(str(fp))
         logger.info("cleanup_storage run completed")
 
 
 def main():
-    cfg = load_settings(ROOT / "settings.ini")
-    rm = ReelsManager(cfg)
-
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--once", action="store_true", help="Run both jobs once and exit")
+    p.add_argument("--once", action="store_true", help="Run every account once and exit")
     p.add_argument("--disable-interaction", action="store_true", help="Disable responding to DMs/comments")
     args = p.parse_args()
 
-    scheduler = BackgroundScheduler()
-    rm.scheduler = scheduler  # expose to internal API
-
-    # start internal API sidecar (daemon thread — dies with main process)
-    from src.api import create_app, set_manager
-    set_manager(rm)
-    _api_app = create_app()
-
-    def _run_sidecar():
-        uvicorn.run(_api_app, host="0.0.0.0", port=8080, log_level="warning")
-
-    threading.Thread(target=_run_sidecar, daemon=True, name="internal-api").start()
-    logger.info("Internal API sidecar started on :8080")
-
-    search_cron = cfg.get("scheduler", "search_cron", fallback="*/15 * * * *")
-    interact_cron = cfg.get("scheduler", "interactions_cron", fallback="*/5 * * * *")
-    cleanup_cron = cfg.get("cleanup", "cleanup_cron", fallback="0 0 */3 * *")
-
-    scheduler.add_job(rm.search_download_publish, CronTrigger.from_crontab(search_cron), id="search_job")
-    if not args.disable_interaction:
-        scheduler.add_job(rm.respond_interactions, CronTrigger.from_crontab(interact_cron), id="interact_job")
-    else:
-        logger.info("Interactions disabled by CLI flag; not scheduling respond_interactions job")
-    scheduler.add_job(rm.cleanup_storage, CronTrigger.from_crontab(cleanup_cron), id="cleanup_job")
+    if not SETTINGS_PATH.exists():
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(ROOT / "settings.ini", SETTINGS_PATH)
+    cfg = load_settings()
+    rm = ReelsManager(cfg)
 
     if args.once:
-        logger.info("Running jobs once (cli --once)")
-        rm.search_download_publish()
-        if not args.disable_interaction:
-            rm.respond_interactions()
-        else:
-            logger.info("Interactions disabled by CLI flag; skipping respond_interactions run")
+        for acc in rm.list_accounts():
+            rm.run_account(acc["id"])
         return
 
+    rm.scheduler = scheduler = BackgroundScheduler()
+    for acc in rm.list_accounts():
+        rm.schedule_account(acc["id"])
+    interact_cron = cfg.get("scheduler", "interactions_cron", fallback="*/30 * * * *")
+    if args.disable_interaction:
+        rm.interactions_enabled = False
+        logger.info("Interactions disabled by CLI flag")
+    else:
+        scheduler.add_job(rm.respond_interactions, CronTrigger.from_crontab(interact_cron), id="interact_job",
+                          name="Respond Interactions", max_instances=1, coalesce=True)
+    scheduler.add_job(rm.cleanup_storage, CronTrigger.from_crontab(
+        cfg.get("cleanup", "cleanup_cron", fallback="0 0 * * *")), id="cleanup_job", name="Cleanup Storage")
     scheduler.start()
-    logger.info("Scheduler started. Jobs: search -> %s, interactions -> %s", search_cron, interact_cron)
 
-    try:
-        # keep the main thread alive
-        import time
-        while True:
-            time.sleep(60)
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+    from src.api import create_app, set_manager
+    set_manager(rm)
+    logger.info("Scheduler started with %d account(s); internal API on :8080", len(rm.list_accounts()))
+    uvicorn.run(create_app(), host="0.0.0.0", port=8080, log_level="warning")
 
 
 if __name__ == "__main__":
@@ -831,3 +479,4 @@ if __name__ == "__main__":
         main()
     except Exception:
         logger.exception("Fatal error in manager")
+        raise

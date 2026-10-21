@@ -10,7 +10,7 @@ from dashboard.auth import (
     verify_password, hash_password, create_session_token,
     get_current_user, require_auth, SESSION_COOKIE, SESSION_MAX_AGE,
 )
-from dashboard.routes import overview, jobs, settings, logs, executions, instagram
+from dashboard.routes import overview, jobs, settings, logs, executions, instagram, accounts
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -94,6 +94,7 @@ def create_app() -> FastAPI:
     app.include_router(logs.router)
     app.include_router(executions.router)
     app.include_router(instagram.router)
+    app.include_router(accounts.router)
 
     return app
 

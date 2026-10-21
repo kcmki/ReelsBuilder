@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Accounts{% endblock %}
+{% block content %}
+
+<div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap">
+  <div>
+    <div class="page-title">Accounts</div>
+    <div class="page-subtitle">Each Instagram account has its own schedule, search queries, caption and edit style</div>
+  </div>
+  <a href="/accounts/new" class="btn btn-primary btn-sm">+ Add account</a>
+</div>
+
+{% if error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}
+<div id="acc-feedback" aria-live="polite"></div>
+
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Account</th><th>Status</th><th>Schedule</th><th>Style</th><th>Published</th><th>Queued</th><th>Next run</th><th style="width:170px">Actions</th></tr></thead>
+      <tbody>
+        {% for a in accounts %}
+        <tr>
+          <td><a href="/accounts/{{ a.id }}"><strong>{{ a.name }}</strong></a><div class="form-hint">IG {{ a.ig_business_id }}</div></td>
+          <td>{% if a.enabled %}<span class="badge badge-green">Enabled</span>{% else %}<span class="badge badge-gray">Paused</span>{% endif %}</td>
+          <td><code>{{ a.cron }}</code></td>
+          <td>{{ a.edit.mode }} · {{ a.edit.layout }}</td>
+          <td>{{ a.published }}</td>
+          <td><a href="/reels?account_id={{ a.id }}">{{ a.queued }}</a></td>
+          <td>{{ a.next_run_time[:16].replace('T', ' ') if a.next_run_time else '—' }}</td>
+          <td>
+            <div style="display:flex;gap:6px">
+              <a href="/accounts/{{ a.id }}" class="btn btn-ghost btn-sm">Edit</a>
+              <button class="btn btn-primary btn-sm" hx-post="/accounts/{{ a.id }}/run" hx-target="#acc-feedback">Run now</button>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+        {% if not accounts and not error %}
+        <tr><td colspan="8" style="text-align:center;color:var(--fg-muted);padding:24px">No accounts yet — add your first Instagram account.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

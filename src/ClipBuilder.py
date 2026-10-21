@@ -1,185 +1,254 @@
-import os
+"""ffmpeg-only reel editor: picks highlight windows and renders 9:16 reels."""
+import json
+import shutil
 import subprocess
-import traceback
-from typing import List
+import tempfile
+import textwrap
 from pathlib import Path
+from typing import List, Optional
 
-from moviepy import (
-    VideoFileClip,
-    CompositeVideoClip,
-    ImageClip,
-    vfx
-)
-from skimage.filters import gaussian
+FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
+# Single source of truth for per-account editing options (the dashboard renders its form from this).
+# (key, label, type, default, options/hint)
+EDIT_FIELDS = [
+    ("mode", "Reel type", "select", "single", ["single", "montage"]),
+    ("layout", "Layout", "select", "blur", ["blur", "crop", "fit"]),
+    ("clips_count", "Highlights per video", "int", 5, "single: reels per video · montage: segments in the reel"),
+    ("clip_length", "Highlight length (s)", "float", 20, "montage: use 3-8s for punchy cuts"),
+    ("max_duration", "Max reel length (s)", "float", 90, ""),
+    ("transition", "Montage transition", "select", "fade",
+     ["none", "fade", "fadeblack", "dissolve", "wipeleft", "slideleft", "slideup", "circleopen", "zoomin", "pixelize"]),
+    ("transition_duration", "Transition length (s)", "float", 0.5, ""),
+    ("zoom", "Foreground zoom", "float", 1.0, "blur layout: >1 fills more of the frame"),
+    ("speed", "Playback speed", "float", 1.0, "0.5 - 2.0"),
+    ("saturation", "Saturation", "float", 1.15, "1 = original"),
+    ("contrast", "Contrast", "float", 1.05, "1 = original"),
+    ("trim_right", "Trim right edge (%)", "float", 10, "hides channel watermarks"),
+    ("trim_bottom", "Trim bottom edge (%)", "float", 10, ""),
+    ("fade", "Fade in/out", "bool", True, ""),
+    ("text", "Overlay text", "text", "", "supports {title}; empty = none"),
+    ("text_position", "Text position", "select", "top", ["top", "center", "bottom"]),
+    ("logo_position", "Logo position", "select", "bottom", ["none", "top", "bottom"]),
+]
+EDIT_DEFAULTS = {k: d for k, _, _, d, _ in EDIT_FIELDS}
+W, H, FPS = 1080, 1920, 30
+
+
+def coerce_edit(raw: Optional[dict]) -> dict:
+    """Merge user values over defaults, casting to the declared type (input comes from the web form)."""
+    out = dict(EDIT_DEFAULTS)
+    for key, _, typ, default, opts in EDIT_FIELDS:
+        if not raw or key not in raw or raw[key] is None:
+            continue
+        v = raw[key]
+        try:
+            if typ == "int":
+                out[key] = int(float(v))
+            elif typ == "float":
+                out[key] = float(v)
+            elif typ == "bool":
+                out[key] = v if isinstance(v, bool) else str(v).lower() in ("1", "true", "on", "yes")
+            elif typ == "select":
+                out[key] = v if v in opts else default
+            else:
+                out[key] = str(v)
+        except (TypeError, ValueError):
+            pass
+    out["speed"] = min(max(out["speed"], 0.5), 2.0)  # atempo range
+    out["clips_count"] = max(out["clips_count"], 1)
+    return out
+
+
+def probe(path: str) -> dict:
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type",
+         "-of", "json", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(r.stdout)
+    return {
+        "duration": float(data["format"]["duration"]),
+        "has_audio": any(s.get("codec_type") == "audio" for s in data.get("streams", [])),
+    }
+
+
+def pick_windows(heatmap: Optional[list], duration: float, count: int, length: float) -> List[tuple]:
+    """Return up to `count` non-overlapping (start, length) windows, chronological.
+
+    heatmap: yt-dlp "most replayed" list [{start_time, end_time, value}]. Its peaks are taken first
+    (opened slightly early so the moment has context); evenly spaced windows fill whatever is left.
+    """
+    length = min(length, duration)
+    step = duration / (count + 1)
+    candidates = [float(m["start_time"]) - length * 0.3
+                  for m in sorted(heatmap or [], key=lambda m: m.get("value", 0), reverse=True)]
+    candidates += [step * (i + 1) - length / 2 for i in range(count)]
+    starts = []
+    for s in candidates:
+        s = max(0.0, min(s, duration - length))
+        if all(abs(s - o) >= length for o in starts):
+            starts.append(s)
+        if len(starts) == count:
+            break
+    return [(round(s, 2), length) for s in sorted(starts)]
+
+
+def _run(cmd: list):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {r.stderr[-1500:]}")
+
+
+ENC = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", str(FPS),
+       "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2"]
 
 
 class ClipBuilder:
-    def __init__(
-        self,
-        temp_video_path: str = "temp/video.mp4",
-        logo_path: str | None = None,
-    ):
-        self.temp_video_path = Path(temp_video_path)
-        self.logo_path = Path(logo_path) if logo_path else None
-        self.temp_video_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, edit: Optional[dict] = None, logo_path: Optional[str] = None):
+        self.e = coerce_edit(edit)
+        self.logo = Path(logo_path) if logo_path and Path(logo_path).exists() else None
 
-    # ---------------------------------------------------
-    # CLIP BUILDING
-    # ---------------------------------------------------
-    def build_clips(
-        self,
-        points: List[dict],
-        output_dir: str = "clips",
-        min_duration: int = 20,
-    ) -> List[str]:
-        """
-        Cut clips from a downloaded video using ffmpeg, ensuring no overlaps.
-        """
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+    # --- one highlight -> normalized 1080x1920 segment --------------------------------
+    def _video_chain(self) -> str:
+        e = self.e
+        trim = f"crop=iw*{1 - e['trim_right'] / 100:.4f}:ih*{1 - e['trim_bottom'] / 100:.4f}:0:0"
+        look = f"eq=saturation={e['saturation']}:contrast={e['contrast']},setpts=PTS/{e['speed']}"
+        if e["layout"] == "crop":
+            body = f"[0:v]{trim},{look},scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}[v]"
+        elif e["layout"] == "fit":
+            body = (f"[0:v]{trim},{look},scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                    f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black[v]")
+        else:  # blur: blurred fill behind a centered foreground
+            fw, fh = int(W * e["zoom"]) // 2 * 2, int(H * e["zoom"]) // 2 * 2
+            body = (f"[0:v]{trim},{look},split[a][b];"
+                    f"[a]scale={W // 4}:{H // 4}:force_original_aspect_ratio=increase,crop={W // 4}:{H // 4},"
+                    f"boxblur=10:2,scale={W}:{H}[bg];"
+                    f"[b]scale={fw}:{fh}:force_original_aspect_ratio=decrease[fg];"
+                    f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v]")
+        return body + f";[v]setsar=1,fps={FPS},format=yuv420p[vout]"
 
-        generated_clips = []
-        
-        # Sort points by start time to handle overlap detection linearly
-        sorted_points = sorted(points, key=lambda x: int(x.get("startMillis", 0)))
-        
-        last_end_time = 0.0
-
-        for idx, point in enumerate(sorted_points):
-            intended_start = int(point["startMillis"]) / 1000
-            duration = max(int(point["durationMillis"]) / 1000, min_duration)
-            
-            # Ensure we don't start before the previous clip ended
-            start_time = max(intended_start, last_end_time)
-            
-            # If the intended start was adjusted, we should check if there's still room for a clip
-            # or if we should just shift the duration. 
-            # To keep it simple and ensure no overlap:
-            end_time = start_time + duration
-            
-            output_file = output_dir / f"clip_{idx + 1}.mp4"
-
-            print(f"Generating clip {idx+1}: start={start_time}s, duration={duration}s (intended start was {intended_start}s)")
-
-            command = [
-                "ffmpeg",
-                "-ss", str(start_time),
-                "-i", str(self.temp_video_path),
-                "-t", str(duration),
-                "-c:v", "libx264",
-                "-c:a", "aac",
-                "-y",
-                str(output_file),
-            ]
-
-            try:
-                subprocess.run(command, check=True, capture_output=True)
-                generated_clips.append(str(output_file))
-                last_end_time = end_time
-            except subprocess.CalledProcessError as e:
-                print(f"Error generating clip {idx+1}: {e.stderr.decode()}")
-                continue
-
-        return generated_clips
-
-    # ---------------------------------------------------
-    # BLUR UTIL
-    # ---------------------------------------------------
-    @staticmethod
-    def blur(gf, t):
-        image = gf(t)
-        return gaussian(image.astype(float), sigma=2)
-
-    # ---------------------------------------------------
-    # CONVERT TO REELS
-    # ---------------------------------------------------
-    def blur(self,gf,t):
-        """ Returns a blurred (radius=2 pixels) version of the image """
-        image = gf(t)
-        return gaussian(image.astype(float), sigma=2)
-
-    
-    def convert_to_reels(
-        self,
-        input_clip: str,
-        output_clip: str,
-        height: int = 480,
-    ) -> None:
-        clip = VideoFileClip(input_clip)
-        width, height = clip.size
-
-        # Calculate the crop dimensions
-        crop_width = int(width * 0.10)   # 5% from the right
-        crop_height = int(height * 0.10) # 5% from the bottom
-
-        # Apply the crop effect
-        # remove 5% from each side of the video to remove watermarks/logos
-        clip = clip.with_effects([
-            vfx.Crop(
-                x1=0,#crop_width,  # Crop from the left
-                y1=0,#crop_height, # Crop from the top
-                x2=width - crop_width,  # Crop from the right
-                y2=height - crop_height # Crop from the bottom
-            )
-        ])
-        # Check if the video is landscape (width > height)
-        print("Converting landscape video to Reels format...")
-
-        if clip.size[0] > clip.size[1]:
-            print("Converting landscape video to Reels format...")
-            
-            # Resize to 9:16 aspect ratio with zoomed-in background (cropping/zooming part)
-            # Make background video (zoomed & blurred)
-            width = clip.size[1] * height // clip.size[0]
-            background_clip = clip.with_effects([vfx.Resize(height=height),vfx.Crop(x_center=clip.size[0] // 2, width=width)])
-            background_clip = background_clip.transform(self.blur)
-            # Crop the original clip to center and match the 9:16 aspect ratio
-            main_clip = clip.with_effects([vfx.Resize(width=width)]) 
-            
-            logo_path = Path("./logo/logo.png")
-            if self.logo_path and self.logo_path.exists():
-                logo_path = self.logo_path
-            if logo_path.exists():
-                logo = ImageClip(str(logo_path)).with_duration(clip.duration)
-                logo = logo.with_effects([vfx.Resize(height=50), vfx.Margin(bottom=10, opacity=0)])
-                layers = [background_clip, main_clip.with_position(("center", "center")), logo.with_position(("center", "bottom"))]
-            else:
-                layers = [background_clip, main_clip.with_position(("center", "center"))]
-
-            # Overlay the main clip on the background clip
-            final_clip = CompositeVideoClip(layers)
-            
-            # Write the final clip to file with a more comprehensive argument for video settings
-            final_clip.write_videofile(output_clip, codec="libx264", audio_codec="aac", threads=12, preset='ultrafast',ffmpeg_params=["-movflags", "+faststart"])
-            print(f"Reels format video saved to {output_clip}")
+    def render_segment(self, source: str, start: float, length: float, out: str, has_audio: bool):
+        cmd = ["ffmpeg", "-y", "-ss", str(start), "-t", str(length), "-i", source]
+        if has_audio:
+            achain = f"[0:a]atempo={self.e['speed']},aresample=48000[aout]"
         else:
-            print("No need for conversion, video is already in vertical format.")
+            cmd += ["-f", "lavfi", "-t", str(length / self.e["speed"]), "-i", "anullsrc=r=48000:cl=stereo"]
+            achain = "[1:a]anull[aout]"
+        cmd += ["-filter_complex", f"{self._video_chain()};{achain}", "-map", "[vout]", "-map", "[aout]",
+                *ENC, out]
+        _run(cmd)
 
-    # ---------------------------------------------------
-    # FULL PIPELINE
-    # ---------------------------------------------------
-    def build_reels_from_points(
-        self,
-        points: List[dict],
-        clips_dir: str,
-        reels_dir: str,
-        retries: int = 3,
-    ) -> None:
-        clips_dir = Path(clips_dir)
-        reels_dir = Path(reels_dir)
+    # --- segments -> one clip with transitions ---------------------------------------
+    def join(self, segments: List[str], out: str):
+        if len(segments) == 1:
+            shutil.copy(segments[0], out)
+            return
+        t = self.e["transition_duration"]
+        if self.e["transition"] == "none" or t <= 0:
+            lst = Path(out).with_suffix(".txt")
+            lst.write_text("".join(f"file '{Path(s).resolve().as_posix()}'\n" for s in segments))
+            _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", out])
+            lst.unlink()
+            return
+        durs = [probe(s)["duration"] for s in segments]
+        t = min(t, min(durs) / 2)
+        parts, v, a, offset = [], "[0:v]", "[0:a]", 0.0
+        for i in range(1, len(segments)):
+            offset += durs[i - 1] - t
+            parts.append(f"{v}[{i}:v]xfade=transition={self.e['transition']}:duration={t}:offset={offset:.3f}[v{i}]")
+            parts.append(f"{a}[{i}:a]acrossfade=d={t}[a{i}]")
+            v, a = f"[v{i}]", f"[a{i}]"
+        cmd = ["ffmpeg", "-y"]
+        for s in segments:
+            cmd += ["-i", s]
+        _run(cmd + ["-filter_complex", ";".join(parts), "-map", v, "-map", a, *ENC, out])
 
-        clips_dir.mkdir(parents=True, exist_ok=True)
-        reels_dir.mkdir(parents=True, exist_ok=True)
+    # --- logo, text, fades, length cap -----------------------------------------------
+    def finish(self, src: str, out: str, title: str = ""):
+        e = self.e
+        dur = min(probe(src)["duration"], e["max_duration"])
+        cmd = ["ffmpeg", "-y", "-i", src]
+        chain, v = [], "[0:v]"
+        if self.logo and e["logo_position"] != "none":
+            cmd += ["-i", str(self.logo)]
+            y = int(H * 0.04) if e["logo_position"] == "top" else f"H-h-{int(H * 0.04)}"
+            chain.append(f"[1:v]scale=-1:{int(H * 0.06)}[lg];{v}[lg]overlay=(W-w)/2:{y}[vl]")
+            v = "[vl]"
+        text = e["text"].replace("{title}", title or "").strip()
+        filters = []
+        if text:
+            tf = Path(out).with_suffix(".txt")
+            tf.write_text("\n".join(textwrap.wrap(text, 24)[:4]), encoding="utf-8")
+            y = {"top": "h*0.12", "center": "(h-text_h)/2", "bottom": "h*0.78-text_h"}[e["text_position"]]
+            # ':' and '\' are drawtext separators; use forward slashes and escape the drive colon on Windows
+            tpath = tf.resolve().as_posix().replace(":", "\\:")
+            filters.append(f"drawtext=textfile='{tpath}':fontfile='{FONT if Path(FONT).exists() else ''}'"
+                           f":fontsize={int(H * 0.035)}:fontcolor=white:borderw=5:bordercolor=black"
+                           f":line_spacing=12:x=(w-text_w)/2:y={y}")
+        afilter = "anull"
+        if e["fade"] and dur > 2:
+            filters.append(f"fade=t=in:st=0:d=0.4,fade=t=out:st={dur - 0.5:.2f}:d=0.5")
+            afilter = f"afade=t=in:st=0:d=0.4,afade=t=out:st={dur - 0.5:.2f}:d=0.5"
+        chain.append(f"{v}{','.join(filters) or 'null'}[vout]")
+        chain.append(f"[0:a]{afilter}[aout]")
+        cmd += ["-t", f"{dur:.2f}", "-filter_complex", ";".join(chain), "-map", "[vout]", "-map", "[aout]",
+                *ENC, "-movflags", "+faststart", out]
+        try:
+            _run(cmd)
+        finally:
+            if text:
+                Path(out).with_suffix(".txt").unlink(missing_ok=True)
 
-        for _ in range(retries):
-            try:
-                clips = self.build_clips(points, output_dir=clips_dir)
+    # --- full pipeline ---------------------------------------------------------------
+    def build(self, source: str, heatmap: Optional[list], out_dir: str, title: str = "") -> List[str]:
+        """Render reels for one downloaded video. Returns output paths."""
+        e = self.e
+        info = probe(source)
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        windows = pick_windows(heatmap, info["duration"], e["clips_count"], e["clip_length"] * e["speed"])
+        outputs = []
+        with tempfile.TemporaryDirectory(dir=out_dir) as tmp:
+            segs = []
+            for i, (start, length) in enumerate(windows):
+                seg = f"{tmp}/seg_{i}.mp4"
+                self.render_segment(source, start, length, seg, info["has_audio"])
+                segs.append(seg)
+            groups = [segs] if e["mode"] == "montage" else [[s] for s in segs]
+            for i, group in enumerate(groups):
+                joined = f"{tmp}/joined_{i}.mp4"
+                self.join(group, joined)
+                out = out_dir / f"reel_{i + 1}.mp4"
+                self.finish(joined, str(out), title)
+                outputs.append(str(out))
+        return outputs
 
-                for clip_path in clips:
-                    output_clip = reels_dir / f"reels_{Path(clip_path).name}"
-                    self.convert_to_reels(clip_path, str(output_clip))
 
-                break
-            except Exception:
-                traceback.print_exc()
+if __name__ == "__main__":
+    # self-check: window picking + a real render of both modes from a synthetic source
+    hm = [{"start_time": t, "end_time": t + 1, "value": v} for t, v in [(10, 0.9), (11, 0.8), (50, 1.0), (90, 0.5)]]
+    w = pick_windows(hm, 100, 3, 10)
+    assert w == [(7.0, 10), (47.0, 10), (87.0, 10)], w  # 11s peak overlaps 10s peak -> skipped
+    assert pick_windows(None, 100, 3, 10) == [(20.0, 10), (45.0, 10), (70.0, 10)]
+    assert pick_windows(hm, 5, 2, 10) == [(0.0, 5)]  # short video clamps
+    # sparse heatmap: the peak is kept, evenly spaced windows top it up
+    assert pick_windows([{"start_time": 25, "value": 1}], 40, 4, 5) == [(5.5, 5), (13.5, 5), (23.5, 5), (29.5, 5)]
+    assert coerce_edit({"speed": "9", "mode": "evil", "fade": "on"})["speed"] == 2.0
+    assert coerce_edit({"mode": "evil"})["mode"] == "single"
+
+    import sys
+    with tempfile.TemporaryDirectory() as d:
+        src = f"{d}/src.mp4"
+        _run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc2=s=1280x720:d=30", "-f", "lavfi",
+              "-i", "sine=d=30", "-shortest", *ENC, src])
+        for mode in ("single", "montage"):
+            cb = ClipBuilder({"mode": mode, "clips_count": 3, "clip_length": 4, "text": "{title}"})
+            outs = cb.build(src, None, f"{d}/{mode}", title="Self check title that is long enough to wrap")
+            assert len(outs) == (3 if mode == "single" else 1), outs
+            p = probe(outs[0])
+            assert p["has_audio"], p
+            print(mode, [round(probe(o)["duration"], 1) for o in outs])
+        if "--keep" in sys.argv:
+            shutil.copytree(d, sys.argv[-1], dirs_exist_ok=True)
+    print("ClipBuilder self-check OK")

@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block title %}{{ a.name or 'New account' }}{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title"><a href="/accounts" style="color:var(--fg-muted)">Accounts</a> / {{ a.name or 'New account' }}</div>
+  <div class="page-subtitle">Changes apply from the next run — schedules reload immediately</div>
+</div>
+
+{% if request.query_params.get('saved') %}<div class="alert alert-success" role="status">Saved.</div>{% endif %}
+{% if error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}
+
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:16px;align-items:start">
+
+<form method="post" action="/accounts/save" style="display:contents">
+  <input type="hidden" name="id" value="{{ a.id or '' }}">
+
+  <div class="card form-section">
+    <div class="form-section-title">Connection</div>
+    <div class="form-group">
+      <label class="form-label" for="name">Name</label>
+      <input type="text" id="name" name="name" value="{{ a.name or '' }}" required>
+    </div>
+    <div class="form-group">
+      <label class="form-label" style="display:flex;gap:8px;align-items:center">
+        <input type="hidden" name="enabled" value="0">
+        <input type="checkbox" name="enabled" value="1" {% if a.enabled %}checked{% endif %}> Enabled (scheduled runs)
+      </label>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="ig_business_id">Instagram business account ID</label>
+      <input type="text" id="ig_business_id" name="ig_business_id" value="{{ a.ig_business_id or '' }}" required>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="page_id">Facebook page ID</label>
+      <input type="text" id="page_id" name="page_id" value="{{ a.page_id or '' }}">
+      <div class="form-hint">Only needed for DM auto-replies</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="access_token">Long-lived access token</label>
+      <input type="password" id="access_token" name="access_token" autocomplete="off"
+        placeholder="{% if a.id %}Leave blank to keep {{ a.token_hint }}{% endif %}" {% if not a.id %}required{% endif %}>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="cron">Schedule (cron)</label>
+      <input type="text" id="cron" name="cron" value="{{ a.cron or '0 * * * *' }}">
+      <div class="form-hint">Each run publishes one reel. <code>0 9,13,19 * * *</code> = 3 posts a day</div>
+    </div>
+  </div>
+
+  <div class="card form-section">
+    <div class="form-section-title">Content</div>
+    <div class="form-group">
+      <label class="form-label" for="queries">YouTube search queries</label>
+      <textarea id="queries" name="queries" rows="5">{{ a.queries or '' }}</textarea>
+      <div class="form-hint">One per line — tried in order until a new video is found</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="caption">Caption</label>
+      <textarea id="caption" name="caption" rows="4">{{ a.caption or '' }}</textarea>
+      <div class="form-hint">Supports <code>{title}</code> and <code>{video_id}</code></div>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="reply_message">Auto-reply message</label>
+      <textarea id="reply_message" name="reply_message" rows="2">{{ a.reply_message or '' }}</textarea>
+      <div class="form-hint">Used for comments/DMs when interactions are enabled; empty = no replies</div>
+    </div>
+  </div>
+
+  <div class="card form-section" style="grid-column:1/-1">
+    <div class="form-section-title">Edit style</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:0 16px">
+    {% for f in fields %}
+      {% set val = a.edit.get(f.key, f.default) if a.edit else f.default %}
+      <div class="form-group">
+        {% if f.type == 'bool' %}
+        <label class="form-label" style="display:flex;gap:8px;align-items:center">
+          <input type="hidden" name="edit__{{ f.key }}" value="false">
+          <input type="checkbox" name="edit__{{ f.key }}" value="true" {% if val in (true, 'true', 'on', '1') %}checked{% endif %}> {{ f.label }}
+        </label>
+        {% else %}
+        <label class="form-label" for="edit__{{ f.key }}">{{ f.label }}</label>
+        {% if f.type == 'select' %}
+        <select id="edit__{{ f.key }}" name="edit__{{ f.key }}">
+          {% for o in f.options %}<option value="{{ o }}" {% if o == val %}selected{% endif %}>{{ o }}</option>{% endfor %}
+        </select>
+        {% elif f.type in ('int', 'float') %}
+        <input type="number" id="edit__{{ f.key }}" name="edit__{{ f.key }}" value="{{ val }}" step="{{ '1' if f.type == 'int' else '0.05' }}">
+        {% else %}
+        <input type="text" id="edit__{{ f.key }}" name="edit__{{ f.key }}" value="{{ val }}">
+        {% endif %}
+        {% endif %}
+        {% if f.hint %}<div class="form-hint">{{ f.hint }}</div>{% endif %}
+      </div>
+    {% endfor %}
+    </div>
+    <div class="form-hint" style="margin-bottom:12px">
+      <strong>single</strong>: each highlight becomes its own reel (queued, one published per run) ·
+      <strong>montage</strong>: highlights are cut together with transitions into one reel ·
+      <strong>blur</strong>: video centered over a blurred copy · <strong>crop</strong>: fills the frame · <strong>fit</strong>: black bars
+    </div>
+    <button type="submit" class="btn btn-primary">{{ 'Save changes' if a.id else 'Create account' }}</button>
+  </div>
+</form>
+
+{% if a.id %}
+  <div class="card form-section">
+    <div class="form-section-title">Tools</div>
+    <div id="tool-feedback" aria-live="polite"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">
+      <button class="btn btn-ghost btn-sm" hx-post="/accounts/{{ a.id }}/test" hx-target="#tool-feedback">Test connection</button>
+      <button class="btn btn-ghost btn-sm" hx-post="/accounts/{{ a.id }}/run" hx-target="#tool-feedback">Run now</button>
+      <a class="btn btn-ghost btn-sm" href="/reels?account_id={{ a.id }}">Reels queue ({{ a.queued }})</a>
+    </div>
+    <form hx-post="/accounts/{{ a.id }}/process" hx-target="#tool-feedback">
+      <label class="form-label" for="url">Build reels from a YouTube URL</label>
+      <div style="display:flex;gap:8px">
+        <input type="text" id="url" name="url" placeholder="https://www.youtube.com/watch?v=…" required>
+        <button class="btn btn-primary btn-sm" type="submit">Render</button>
+      </div>
+      <div class="form-hint">Rendered with this account's edit style and added to its queue — preview before it publishes</div>
+    </form>
+  </div>
+
+  <div class="card form-section">
+    <div class="form-section-title">Logo overlay</div>
+    <p class="form-hint" style="margin-bottom:12px">{% if a.has_logo %}A logo is set.{% else %}No logo set.{% endif %} PNG with transparency works best.</p>
+    <form method="post" action="/accounts/{{ a.id }}/logo" enctype="multipart/form-data" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <input type="file" name="logo" accept="image/png,image/jpeg,image/webp" required>
+      <button class="btn btn-primary btn-sm" type="submit">Upload</button>
+    </form>
+    {% if a.has_logo %}
+    <form method="post" action="/accounts/{{ a.id }}/logo" enctype="multipart/form-data" style="margin-top:8px">
+      <input type="hidden" name="remove" value="1">
+      <button class="btn btn-ghost btn-sm" type="submit">Remove logo</button>
+    </form>
+    {% endif %}
+  </div>
+
+  <div class="card form-section">
+    <div class="form-section-title">Danger zone</div>
+    <form method="post" action="/accounts/{{ a.id }}/delete" onsubmit='return confirm({{ ("Delete " ~ a.name ~ " and its queued reels?")|tojson }})'>
+      <button class="btn btn-danger btn-sm" type="submit">Delete account</button>
+    </form>
+  </div>
+{% endif %}
+
+</div>
+{% endblock %}

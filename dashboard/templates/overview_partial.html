@@ -38,6 +38,31 @@
     </div>
   </div>
 
+  {% if status.get('accounts') %}
+  <div class="card" style="margin-top:16px">
+    <div class="form-section-title">Accounts</div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Account</th><th>Status</th><th>Published</th><th>Queued</th><th>Last published</th><th>Next run</th></tr></thead>
+        <tbody>
+          {% for a in status['accounts'] %}
+          <tr>
+            <td><a href="/accounts/{{ a.id }}">{{ a.name }}</a></td>
+            <td>{% if a.enabled %}<span class="badge badge-green">Enabled</span>{% else %}<span class="badge badge-gray">Paused</span>{% endif %}</td>
+            <td>{{ a.published }}</td>
+            <td><a href="/reels?account_id={{ a.id }}">{{ a.queued }}</a></td>
+            <td>{{ a.last_published[:16].replace('T', ' ') if a.last_published else '—' }}</td>
+            <td>{{ a.next_run_time[:16].replace('T', ' ') if a.next_run_time else '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% elif status %}
+  <div class="card" style="margin-top:16px">No accounts yet — <a href="/accounts/new">add your first Instagram account</a>.</div>
+  {% endif %}
+
   {% if status.get('jobs') %}
   <div class="card" style="margin-top:16px">
     <div class="form-section-title">Upcoming Runs</div>

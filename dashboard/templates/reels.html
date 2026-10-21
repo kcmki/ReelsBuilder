@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Reels{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">Reels</div>
+  <div class="page-subtitle">Preview rendered reels, publish one now, or drop the ones you don't like</div>
+</div>
+
+<form method="get" action="/reels" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;align-items:center">
+  <select name="account_id" onchange="this.form.submit()" style="width:auto">
+    <option value="0">All accounts</option>
+    {% for acc in accounts %}<option value="{{ acc.id }}" {% if acc.id == account_id %}selected{% endif %}>{{ acc.name }}</option>{% endfor %}
+  </select>
+  {% for s, label in [('queued', 'Queued'), ('published', 'Published'), ('deleted', 'Dropped'), ('', 'All')] %}
+  <a href="/reels?account_id={{ account_id }}&status={{ s }}" class="btn btn-sm {% if status == s %}btn-primary{% else %}btn-ghost{% endif %}">{{ label }}</a>
+  {% endfor %}
+</form>
+
+<div id="reel-feedback" aria-live="polite"></div>
+
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px">
+  {% for c in clips['items'] %}
+  <div class="card" id="reel-{{ c.id }}" style="padding:12px">
+    {% if not c.published and not c.deleted_at %}
+    <video src="/reels/{{ c.id }}/video" controls preload="metadata" playsinline
+      style="width:100%;aspect-ratio:9/16;background:#000;border-radius:6px;display:block"></video>
+    {% endif %}
+    <div style="margin-top:8px;font-size:13px">
+      <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ c.title or '' }}"><strong>{{ c.title or c.video_id }}</strong></div>
+      <div class="form-hint">{{ c.account or '—' }} · {{ "%.0f"|format(c.duration) if c.duration else '?' }}s · {{ c.created_at[:16].replace('T', ' ') if c.created_at else '' }}</div>
+      <div style="margin-top:6px">
+        {% if c.published %}<span class="badge badge-green">Published {{ c.published_at[:10] if c.published_at else '' }}</span>
+        {% elif c.deleted_at %}<span class="badge badge-gray">Dropped</span>
+        {% elif c.attempts %}<span class="badge badge-red" title="{{ c.error or '' }}">Failed ×{{ c.attempts }}</span>
+        {% else %}<span class="badge badge-warn">Queued</span>{% endif %}
+      </div>
+      {% if c.error and not c.published %}<div class="form-hint" style="color:var(--danger, #e5484d);margin-top:4px">{{ c.error[:160] }}</div>{% endif %}
+    </div>
+    {% if not c.published and not c.deleted_at %}
+    <div style="display:flex;gap:6px;margin-top:10px">
+      <button class="btn btn-primary btn-sm" hx-post="/reels/{{ c.id }}/publish" hx-target="#reel-feedback">Publish now</button>
+      <button class="btn btn-ghost btn-sm" hx-post="/reels/{{ c.id }}/delete" hx-target="#reel-{{ c.id }}" hx-swap="outerHTML"
+        hx-confirm="Drop this reel?">Drop</button>
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% if not clips['items'] %}
+<div class="card" style="text-align:center;color:var(--fg-muted);padding:24px">Nothing here.</div>
+{% endif %}
+
+<div class="pagination">
+  {% if page > 1 %}<a href="/reels?account_id={{ account_id }}&status={{ status }}&page={{ page-1 }}" class="btn btn-ghost btn-sm">← Prev</a>{% endif %}
+  <span style="color:var(--fg-muted);font-size:12px">Page {{ page }} · {{ clips.total }} total</span>
+  {% if page * 24 < clips.total %}<a href="/reels?account_id={{ account_id }}&status={{ status }}&page={{ page+1 }}" class="btn btn-ghost btn-sm">Next →</a>{% endif %}
+</div>
+
+{% endblock %}
