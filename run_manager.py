@@ -487,10 +487,14 @@ class ReelsManager:
             delete_file(clip["reel_path"])
             delete_file(clip["clip_path"])
             self.x("UPDATE clips SET deleted_at=? WHERE id=?", (now(), clip["id"]))
-        for base in (ROOT / "clips", ROOT / "reels", ROOT / "temp"):
-            for fp in base.rglob("*"):
-                if fp.is_file() and datetime.utcfromtimestamp(fp.stat().st_mtime) < cutoff:
-                    delete_file(str(fp))
+        for base in (ROOT / "temp", ROOT / "clips", ROOT / "reels"):
+            # list first: delete_file prunes empty folders, which would break a live rglob walk
+            for fp in list(base.rglob("*")):
+                try:
+                    if fp.is_file() and datetime.utcfromtimestamp(fp.stat().st_mtime) < cutoff:
+                        delete_file(str(fp))
+                except OSError:
+                    logger.warning("cleanup: could not remove %s", fp)
         logger.info("cleanup_storage run completed")
 
 
