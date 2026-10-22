@@ -96,6 +96,7 @@ def init_db(conn: sqlite3.Connection):
         # account health, shown in the dashboard and exported as metrics
         ("accounts", "auth_failed INTEGER DEFAULT 0"), ("accounts", "last_error TEXT"),
         ("accounts", "last_error_at TEXT"), ("accounts", "last_run_at TEXT"), ("accounts", "last_outcome TEXT"),
+        ("accounts", "query_index INTEGER DEFAULT 0"),  # rotates which search query runs first
     ]:
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
@@ -306,7 +307,12 @@ class ReelsManager:
             if self.queue_size(account_id):
                 outcome = "published" if self.publish_next(acc) else "publish_failed"
                 return
-            for query in acc["queries_list"]:
+            queries = acc["queries_list"]
+            start = (acc["query_index"] or 0) % max(len(queries), 1)
+            for i in range(len(queries)):
+                query = queries[(start + i) % len(queries)]
+                # next run starts at the query after this one, so searches alternate
+                self.x("UPDATE accounts SET query_index=? WHERE id=?", ((start + i + 1) % len(queries), account_id))
                 video = self.find_new_video(query)
                 if video and self.process_video(acc, video["video_id"], title=video["title"]):
                     outcome = "published" if self.publish_next(self.get_account(account_id)) else "publish_failed"
